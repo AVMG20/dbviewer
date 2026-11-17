@@ -1,104 +1,129 @@
 <script setup lang="ts">
-// DataGrip-style raw SQL clause input (WHERE / ORDER BY) with cheap column-name autocomplete.
-import { computed, ref } from "vue";
+// DataGrip-style raw SQL clause input (WHERE / ORDER BY): a single-line CodeMirror 6 editor with SQL
+// highlighting (dialect per driver), column + keyword/operator autocomplete, Enter applies.
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { Compartment, EditorState } from "@codemirror/state";
+import { EditorView, keymap, placeholder as cmPlaceholder } from "@codemirror/view";
+import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import { syntaxHighlighting, bracketMatching } from "@codemirror/language";
+import {
+  acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, type Completion, type CompletionContext,
+} from "@codemirror/autocomplete";
+import { MariaSQL, MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
+import { appHighlight, appTheme } from "@/components/console/cmTheme";
 
 const props = defineProps<{
-  modelValue: string; label: string; placeholder?: string; columns: string[]; error?: string;
+  modelValue: string; label: string; placeholder?: string; columns: string[]; error?: string; driver?: string;
 }>();
 const emit = defineEmits<{ "update:modelValue": [v: string]; apply: [] }>();
 
-const input = ref<HTMLInputElement | null>(null);
-const caret = ref(0);
-const open = ref(false);
-const hi = ref(-1); // -1 = nothing chosen yet: Enter applies; after arrow keys Enter accepts
+const host = ref<HTMLElement | null>(null);
+let view: EditorView | null = null;
+const langConf = new Compartment();
 
-const token = computed(() => {
-  const before = props.modelValue.slice(0, caret.value);
-  const m = /[A-Za-z_][A-Za-z_0-9]*$/.exec(before);
-  return m ? m[0] : "";
-});
-const suggestions = computed(() => {
-  const t = token.value.toLowerCase();
-  if (!open.value || t.length < 1) return [];
-  const starts: string[] = [];
-  const contains: string[] = [];
-  for (const c of props.columns) {
-    const l = c.toLowerCase();
-    if (l === t) continue;
-    if (l.startsWith(t)) starts.push(c);
-    else if (l.includes(t)) contains.push(c);
+const WORDS = [
+  "AND", "OR", "NOT", "IN", "NOT IN", "IS NULL", "IS NOT NULL", "LIKE", "NOT LIKE", "ILIKE", "BETWEEN", "EXISTS",
+  "ASC", "DESC", "NULLS FIRST", "NULLS LAST", "TRUE", "FALSE", "NULL",
+];
+
+function dialect() {
+  switch (props.driver) {
+    case "mysql": return MySQL;
+    case "sqlite": return SQLite;
+    case "mariadb": return MariaSQL;
+    default: return PostgreSQL;
   }
-  return [...starts, ...contains].slice(0, 8);
-});
+}
 
-function sync() {
-  caret.value = input.value?.selectionStart ?? props.modelValue.length;
+function source(ctx: CompletionContext) {
+  const w = ctx.matchBefore(/[A-Za-z_][A-Za-z_0-9]*/);
+  if (!w || (w.from === w.to && !ctx.explicit)) return null;
+  const options: Completion[] = [
+    ...props.columns.map((c): Completion => ({ label: c, type: "property", boost: 2 })),
+    ...WORDS.map((k): Completion => ({ label: k, type: "keyword" })),
+  ];
+  return { from: w.from, options, validFor: /^[A-Za-z_0-9]*$/ };
 }
-function onInput(e: Event) {
-  emit("update:modelValue", (e.target as HTMLInputElement).value);
-  sync();
-  open.value = true;
-  hi.value = -1;
-}
-function accept(name: string) {
-  const el = input.value;
-  const pos = caret.value;
-  const start = pos - token.value.length;
-  const text = props.modelValue.slice(0, start) + name + props.modelValue.slice(pos);
-  emit("update:modelValue", text);
-  open.value = false;
-  const np = start + name.length;
-  requestAnimationFrame(() => {
-    el?.focus();
-    el?.setSelectionRange(np, np);
-    sync();
+
+/** pasted / typed newlines become spaces: the clause stays on one line */
+const singleLine = EditorState.transactionFilter.of((tr) => {
+  if (!tr.docChanged) return tr;
+  let multi = false;
+  tr.changes.iterChanges((_f, _t, _a, _b, ins) => {
+    if (ins.lines > 1) multi = true;
   });
-}
-function onKey(e: KeyboardEvent) {
-  const s = suggestions.value;
-  if (s.length) {
-    if (e.key === "ArrowDown") return e.preventDefault(), void (hi.value = (hi.value + 1) % s.length);
-    if (e.key === "ArrowUp") return e.preventDefault(), void (hi.value = hi.value <= 0 ? s.length - 1 : hi.value - 1);
-    if (e.key === "Tab") return e.preventDefault(), accept(s[Math.max(0, hi.value)]);
-    if (e.key === "Enter" && hi.value >= 0) return e.preventDefault(), accept(s[hi.value]);
-    if (e.key === "Escape") return e.preventDefault(), e.stopPropagation(), void (open.value = false);
-  }
-  if (e.key === "Enter") {
-    e.preventDefault();
-    open.value = false;
-    emit("apply");
-  }
-}
+  if (!multi) return tr;
+  const specs: { from: number; to: number; insert: string }[] = [];
+  tr.changes.iterChanges((f, t, _a, _b, ins) => specs.push({ from: f, to: t, insert: ins.toString().replace(/\r?\n/g, " ") }));
+  return { changes: specs };
+});
+
+const compact = EditorView.theme({
+  "&": { fontSize: "12px", background: "transparent" },
+  ".cm-scroller": { overflowY: "hidden", lineHeight: "20px", fontFamily: "var(--mono)" },
+  ".cm-content": { padding: "0 6px", minHeight: "20px" },
+  ".cm-line": { padding: "0" },
+  ".cm-placeholder": { color: "var(--dim)", opacity: ".55" },
+  "&.cm-focused": { outline: "none" },
+});
+
+onMounted(() => {
+  if (!host.value) return;
+  view = new EditorView({
+    parent: host.value,
+    state: EditorState.create({
+      doc: props.modelValue,
+      extensions: [
+        singleLine,
+        keymap.of([
+          { key: "Tab", run: acceptCompletion },
+          { key: "Enter", run: () => (emit("apply"), true) },
+          { key: "Mod-Enter", run: () => (emit("apply"), true) },
+          ...closeBracketsKeymap, ...completionKeymap, ...historyKeymap, ...defaultKeymap.filter((b) => b.key !== "Enter" && b.key !== "Mod-Enter"),
+        ]),
+        history(),
+        bracketMatching(),
+        closeBrackets(),
+        autocompletion({ override: [source], icons: false, activateOnTyping: true }),
+        syntaxHighlighting(appHighlight),
+        appTheme,
+        compact,
+        langConf.of(sql({ dialect: dialect() })),
+        props.placeholder ? cmPlaceholder(props.placeholder) : [],
+        EditorView.updateListener.of((u) => {
+          if (u.docChanged) emit("update:modelValue", u.state.doc.toString());
+        }),
+      ],
+    }),
+  });
+});
+onBeforeUnmount(() => {
+  view?.destroy();
+  view = null;
+});
+
+watch(() => props.modelValue, (v) => {
+  if (view && v !== view.state.doc.toString()) view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: v } });
+});
+watch(() => props.driver, () => view?.dispatch({ effects: langConf.reconfigure(sql({ dialect: dialect() })) }));
+
+defineExpose({ focus: () => view?.focus() });
 </script>
 
 <template>
   <div class="ci" :class="{ err: !!error }" :title="error">
     <span class="dim mono ci-l">{{ label }}</span>
-    <div class="ci-w">
-      <input
-        ref="input" :value="modelValue" class="input mono" :placeholder="placeholder" spellcheck="false" autocomplete="off"
-        @input="onInput" @keydown="onKey" @keyup="sync" @click="sync" @blur="open = false"
-      />
-      <div v-if="suggestions.length" class="ci-dd">
-        <div
-          v-for="(s, i) in suggestions" :key="s" class="ci-it mono" :class="{ hi: i === hi }"
-          @mousedown.prevent="accept(s)"
-        >{{ s }}</div>
-      </div>
-    </div>
+    <div ref="host" class="ci-ed selectable"></div>
   </div>
 </template>
 
 <style scoped>
 .ci { flex: 1 1 220px; display: flex; align-items: center; gap: 6px; min-width: 160px; }
 .ci-l { font-size: 11px; }
-.ci-w { position: relative; flex: 1; display: flex; }
-.ci-w input { flex: 1; width: 100%; }
-.ci.err input { border-color: var(--danger); }
-.ci-dd {
-  position: absolute; top: 24px; left: 0; z-index: 120; min-width: 180px; background: var(--bg2); border: 1px solid var(--bd);
-  border-radius: 6px; box-shadow: 0 8px 28px var(--shadow); padding: 3px;
+.ci-ed {
+  flex: 1; min-width: 0; height: 22px; overflow: hidden; background: var(--bg); border: 1px solid var(--bd); border-radius: 4px;
 }
-.ci-it { padding: 2px 8px; border-radius: 3px; font-size: 12px; }
-.ci-it.hi { background: var(--ac); color: var(--ac-fg, #fff); }
+.ci-ed:focus-within { border-color: var(--ac); }
+.ci.err .ci-ed { border-color: var(--danger); box-shadow: 0 1px 0 var(--danger); }
+.ci-ed :deep(.cm-editor) { height: 100%; }
 </style>

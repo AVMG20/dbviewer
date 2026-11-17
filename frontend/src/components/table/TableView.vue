@@ -964,8 +964,8 @@ function onAltClick(row: number, col: number) {
     </div>
     <!-- toolbar row 2 -->
     <div class="tb">
-      <SqlClauseInput v-model="whereDraft" label="WHERE" placeholder="e.g. status = 'new'" :columns="colNames" :error="whereError" @apply="applyClauses" />
-      <SqlClauseInput v-model="orderDraft" label="ORDER BY" placeholder="e.g. id DESC" :columns="colNames" @apply="applyClauses" />
+      <SqlClauseInput v-model="whereDraft" label="WHERE" :driver="driver" placeholder="e.g. status = 'new'" :columns="colNames" :error="whereError" @apply="applyClauses" />
+      <SqlClauseInput v-model="orderDraft" label="ORDER BY" :driver="driver" placeholder="e.g. id DESC" :columns="colNames" @apply="applyClauses" />
       <button class="btn" title="Apply WHERE / ORDER BY (↵)" @click="applyClauses">Apply</button>
     </div>
     <div v-if="whereError" class="errbar mono selectable">{{ whereError }}</div>
@@ -1072,7 +1072,6 @@ function onAltClick(row: number, col: number) {
 .chips { background: var(--bg2); }
 .tv-stale { opacity: .4; pointer-events: none; }
 .tv-banner { position: absolute; z-index: 30; top: 34px; left: 50%; transform: translateX(-50%); padding: 3px 12px; border-radius: 4px; background: var(--danger); color: #fff; font-size: 11px; box-shadow: 0 2px 8px var(--shadow); pointer-events: none; }
-:deep(.ci input::placeholder) { opacity: .45; }
 .chip {
   display: inline-flex; align-items: center; gap: 4px; padding: 0 2px 0 8px; height: 20px; border-radius: 10px;
   background: color-mix(in srgb, var(--ac) 18%, transparent); border: 1px solid color-mix(in srgb, var(--ac) 45%, transparent); font-size: 11px; cursor: default;
