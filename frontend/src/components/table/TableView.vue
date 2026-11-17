@@ -3,6 +3,7 @@
 // filters, add/duplicate/delete row, revert, Save, Copy as, Export, record panel) + DataGrid.
 // Nothing is written until Save: edits go to stores/changes and are previewed first.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { kbd } from "@/lib/kbd";
 import type { CancellablePromise } from "@wailsio/runtime";
 import {
   apiError, dataApi, type Driver, projectApi, schemaApi, SQL_DEFAULT,
@@ -17,7 +18,8 @@ import { isMod } from "@/lib/keys";
 import { toastOnce } from "@/lib/notify";
 import type { Tab } from "@/types";
 import { COPY_FORMATS, formatCopy, qualifiedTable, quoteIdent, sqlLiteral } from "@/lib/copyFormats";
-import { cellText, fmtNum, isDefaultValue } from "@/lib/format";
+import { cellText, fmtNum, isDefaultValue, isNumericKind } from "@/lib/format";
+import { settings } from "@/lib/settings";
 import type { AppliedEdits, GridRow, MenuItem, SelectionInfo, SortSpec } from "@/lib/gridTypes";
 import DataGrid from "@/components/grid/DataGrid.vue";
 import ContextMenu from "@/components/common/ContextMenu.vue";
@@ -61,7 +63,7 @@ const orderDraft = ref(props.tab.orderBy ?? "");
 const applied = ref({ where: props.tab.where ?? "", orderBy: props.tab.orderBy ?? "" });
 const sorts = ref<SortSpec[]>([]);
 const columnFilters = ref<ColumnFilter[]>([]);
-const limit = ref(500);
+const limit = ref(settings.pageSize);
 const offset = ref(0);
 const total = ref(-1);
 const estRows = ref(-1);
@@ -409,10 +411,27 @@ function chipText(f: ColumnFilter): string {
   if (f.op === "between") return `${f.column} between ${f.values[0]} and ${f.values[1]}`;
   return `${f.column} ${OP_LABEL[f.op] ?? f.op} ${f.value}`;
 }
-function addCellFilter(row: number, col: number, op: "eq" | "ne" | "is_null" | "not_null") {
+type CellOp = "eq" | "ne" | "is_null" | "not_null" | "contains" | "not_contains" | "gt" | "gte" | "lt" | "lte";
+function addCellFilter(row: number, col: number, op: CellOp) {
   const v = displayRows.value[row]?.values[col];
-  const f: ColumnFilter = { column: columns.value[col].name, op, value: op === "eq" || op === "ne" ? cellText(v) : "", values: [] };
+  const f: ColumnFilter = { column: columns.value[col].name, op, value: op === "is_null" || op === "not_null" ? "" : cellText(v), values: [] };
   setColumnFilter(f);
+}
+/** IN / NOT IN with the distinct non-NULL values of the selected cells in this column. */
+function addInFilter(col: number, op: "in" | "not_in") {
+  const vals = new Set<string>();
+  for (const r of grid.value?.selectedRowsInColumn(col) ?? []) {
+    const gr = displayRows.value[r];
+    const v = gr?.values[col];
+    if (gr && gr.state !== "new" && v !== null && v !== undefined && !isDefaultValue(v)) vals.add(cellText(v));
+  }
+  if (vals.size) setColumnFilter({ column: columns.value[col].name, op, value: "", values: [...vals] });
+}
+/** Short preview of a value for menu labels. */
+function menuValue(v: CellValue): string {
+  const t = cellText(v).replace(/\s+/g, " ");
+  if (typeof v === "number" || /^-?\d+(\.\d+)?$/.test(t)) return t.length > 24 ? t.slice(0, 23) + "…" : t;
+  return t.length > 24 ? `"${t.slice(0, 23)}…"` : `"${t}"`;
 }
 
 // ---- paging --------------------------------------------------------------------------------------
@@ -609,7 +628,7 @@ function deleteSelected() {
   const message = loadedCount && wasDeleted
     ? `${plural(loadedCount)} restored`
     : loadedCount
-      ? `${plural(loadedCount)} marked for deletion — ⌘S to save`
+      ? kbd(`${plural(loadedCount)} marked for deletion — ⌘S to save`)
       : `${plural(removing)} removed`;
   ui.setStatus({ tabId: props.tab.id, message });
 }
@@ -712,6 +731,26 @@ function onFindKey(e: KeyboardEvent) {
   }
 }
 
+// ---- column jump (palette / sidebar column hits) --------------------------------------------------------------------------------
+let focusColSeq = 0;
+function isThisTable(r: { connId: string; schema: string; table: string }): boolean {
+  const t = props.tab;
+  if (r.connId !== t.connId || r.table !== t.table) return false;
+  return !r.schema || !t.schema || r.schema === t.schema || r.schema === conn.value?.defaultSchema;
+}
+watch(
+  [() => ui.focusColumnRequest, columns],
+  async ([req]) => {
+    if (!req || req.seq <= focusColSeq || !isThisTable(req) || !columns.value.length) return;
+    focusColSeq = req.seq;
+    const ci = columns.value.findIndex((c) => c.name === req.column);
+    if (ci < 0) return;
+    await nextTick();
+    // the tab view may have just become visible: wait a frame so the grid has its size
+    requestAnimationFrame(() => grid.value?.focusColumn(ci));
+  },
+);
+
 // ---- keyboard ----------------------------------------------------------------------------------------------------------------
 const overlayOpen = computed(() => ui.overlayOpen);
 function onWinKey(e: KeyboardEvent) {
@@ -765,21 +804,45 @@ function buildMenu({ row, col }: { row: number; col: number }): MenuItem[] {
   const isNull = v === null;
   const items: MenuItem[] = [];
   if (!isNew) {
+    const blob = isBinary(v);
+    const ordered = isNumericKind(c.kind) || c.kind === "date" || c.kind === "datetime" || c.kind === "time";
+    const textual = !ordered && c.kind !== "bool" && !blob;
+    const inRows = (grid.value?.selectedRowsInColumn(col) ?? []).filter((r) => {
+      const x = displayRows.value[r]?.values[col];
+      return x !== null && x !== undefined;
+    });
+    const more: MenuItem[] = [];
+    if (textual && !isNull) more.push(
+      { label: "Contains value", run: () => addCellFilter(row, col, "contains") },
+      { label: "Does not contain value", run: () => addCellFilter(row, col, "not_contains") },
+    );
+    if (ordered && !isNull) more.push(
+      { label: `> ${menuValue(v)}`, run: () => addCellFilter(row, col, "gt") },
+      { label: `≥ ${menuValue(v)}`, run: () => addCellFilter(row, col, "gte") },
+      { label: `< ${menuValue(v)}`, run: () => addCellFilter(row, col, "lt") },
+      { label: `≤ ${menuValue(v)}`, run: () => addCellFilter(row, col, "lte") },
+    );
+    if (inRows.length > 1 && !blob) more.push(
+      { separator: true },
+      { label: `IN selected values (${inRows.length} rows)`, run: () => addInFilter(col, "in") },
+      { label: "NOT IN selected values", run: () => addInFilter(col, "not_in") },
+    );
     items.push(
-      { label: "Filter = value", disabled: isNull, run: () => addCellFilter(row, col, "eq") },
-      { label: "Filter ≠ value", disabled: isNull, run: () => addCellFilter(row, col, "ne") },
+      { label: "Filter = value", disabled: isNull || blob, run: () => addCellFilter(row, col, "eq") },
+      { label: "Filter ≠ value", disabled: isNull || blob, run: () => addCellFilter(row, col, "ne") },
       isNull
         ? { label: "Filter IS NOT NULL", run: () => addCellFilter(row, col, "not_null") }
         : { label: "Filter IS NULL", run: () => addCellFilter(row, col, "is_null") },
-      { separator: true },
     );
+    if (more.length) items.push({ label: "More filters", children: more[0].separator ? more.slice(1) : more });
+    items.push({ separator: true });
   }
   items.push(
-    { label: "Copy", hint: "⌘C", run: () => grid.value?.copy("tsv") },
-    { label: "Copy with headers", hint: "⇧⌘C", run: () => grid.value?.copy("tsv_header") },
+    { label: "Copy", hint: kbd("⌘C"), run: () => grid.value?.copy("tsv") },
+    { label: "Copy with headers", hint: kbd("⇧⌘C"), run: () => grid.value?.copy("tsv_header") },
     { label: "Copy as", children: copyItems() },
     { separator: true },
-    { label: "Paste", hint: "⌘V", disabled: !editable.value, run: pasteFromMenu },
+    { label: "Paste", hint: kbd("⌘V"), disabled: !editable.value, run: pasteFromMenu },
     { separator: true },
     { label: "Edit", hint: "F2", disabled: !editable.value, run: () => grid.value?.startEdit(row, col) },
     { label: "Set NULL", disabled: !editable.value, run: () => grid.value?.setNull() },
@@ -797,8 +860,8 @@ function buildMenu({ row, col }: { row: number; col: number }): MenuItem[] {
   if (fkItems.length) items.push({ separator: true }, ...fkItems);
   items.push(
     { separator: true },
-    { label: "Duplicate row", hint: "⌘D", disabled: !editable.value, run: duplicateRows },
-    { label: gr.state === "deleted" ? "Restore row" : "Delete row", hint: "⌘⌫", danger: true, disabled: !editable.value, run: deleteSelected },
+    { label: "Duplicate row", hint: kbd("⌘D"), disabled: !editable.value, run: duplicateRows },
+    { label: gr.state === "deleted" ? "Restore row" : "Delete row", hint: kbd("⌘⌫"), danger: true, disabled: !editable.value, run: deleteSelected },
   );
   return items;
 }
@@ -874,7 +937,7 @@ function onOpenRecord() {
 const copyContext = computed(() => ({ driver: driver.value, schema: schema.value, table: table.value }));
 const qualified = computed(() => qualifiedTable(driver.value, schema.value, table.value));
 const emptyText = computed(() =>
-  loadError.value ? "" : applied.value.where || columnFilters.value.length ? "No rows match the filters" : editable.value ? "This table is empty. Press ⌘N to add a row." : "This table is empty",
+  loadError.value ? "" : applied.value.where || columnFilters.value.length ? "No rows match the filters" : editable.value ? kbd("This table is empty. Press ⌘N to add a row.") : "This table is empty",
 );
 
 // overlays opening above (modal, palette) close the popovers owned by this view
@@ -904,8 +967,8 @@ function entriesAt(row: number, col: number): NavEntry[] {
 function navTitle(row: number, col: number): string {
   const e = entriesAt(row, col);
   if (!e.length) return "";
-  if (e.length === 1) return e[0].heading === "References" ? `⌘-click to open ${e[0].table}` : `⌘-click to show rows in ${e[0].label}`;
-  return `⌘-click: ${e.length} related tables (⌘⇧-click multi-selects)`;
+  if (e.length === 1) return e[0].heading === "References" ? kbd(`⌘-click to open ${e[0].table}`) : kbd(`⌘-click to show rows in ${e[0].label}`);
+  return kbd(`⌘-click: ${e.length} related tables (⌘⇧-click multi-selects)`);
 }
 function openEntry(en: NavEntry) {
   navMenu.value = null;
@@ -936,7 +999,7 @@ function onAltClick(row: number, col: number) {
   <div class="flex min-h-0 flex-1 flex-col" :style="{ '--conn': tint }">
     <!-- toolbar row 1 -->
     <div class="tb">
-      <button class="btn ghost" title="Refresh (⌘R)" @click="refresh"><Icon name="refresh" /></button>
+      <button class="btn ghost" :title="kbd('Refresh (⌘R)')" @click="refresh"><Icon name="refresh" /></button>
       <span class="mono dim range">{{ rangeText }}</span>
       <button v-if="isEstimate" class="btn ghost cnt" :disabled="counting" title="Count all rows exactly" @click="countExact">{{ counting ? "Counting…" : "Count" }}</button>
       <button class="btn ghost" :disabled="offset === 0" title="Previous page" @click="page(-1)"><Icon name="chevL" /></button>
@@ -945,11 +1008,11 @@ function onAltClick(row: number, col: number) {
         <option v-for="n in [100, 250, 500, 1000, 5000]" :key="n" :value="n">{{ n }} rows</option>
       </select>
       <span class="sep"></span>
-      <button class="btn ghost" :disabled="!editable" :title="editTitle('Add row (⌘N)')" @click="addRow"><Icon name="plus" /></button>
-      <button class="btn ghost" :disabled="!editable" :title="editTitle('Duplicate row (⌘D)')" @click="duplicateRows"><Icon name="dup" /></button>
-      <button class="btn ghost" :disabled="!editable" :title="editTitle('Delete row(s) (⌘⌫)')" @click="deleteSelected"><Icon name="trash" /></button>
-      <button class="btn ghost" :disabled="!pending" title="Revert all changes (⌘Z undoes the last one)" @click="revertAll"><Icon name="undo" /> Revert</button>
-      <button class="btn primary" :disabled="!pending || readOnly" title="Save changes (⌘S)" @click="save">
+      <button class="btn ghost" :disabled="!editable" :title="kbd(editTitle('Add row (⌘N)'))" @click="addRow"><Icon name="plus" /></button>
+      <button class="btn ghost" :disabled="!editable" :title="kbd(editTitle('Duplicate row (⌘D)'))" @click="duplicateRows"><Icon name="dup" /></button>
+      <button class="btn ghost" :disabled="!editable" :title="kbd(editTitle('Delete row(s) (⌘⌫)'))" @click="deleteSelected"><Icon name="trash" /></button>
+      <button class="btn ghost" :disabled="!pending" :title="kbd('Revert all changes (⌘Z undoes the last one)')" @click="revertAll"><Icon name="undo" /> Revert</button>
+      <button class="btn primary" :disabled="!pending || readOnly" :title="kbd('Save changes (⌘S)')" @click="save">
         <Icon name="save" /> Save <span v-if="pending" class="bdg">{{ pending }}</span>
       </button>
       <span v-if="readOnly" class="pill ro" title="This connection is read-only. Editing is disabled."><Icon name="lock" :size="10" /> READ-ONLY</span>
@@ -983,7 +1046,7 @@ function onAltClick(row: number, col: number) {
       <Icon name="search" class="dim" />
       <input ref="findInput" v-model="findText" class="input mono" placeholder="Find in loaded rows" spellcheck="false" style="width: 220px" @keydown="onFindKey" />
       <span class="dim mono">{{ findText ? `${findCount} match${findCount === 1 ? "" : "es"}` : "" }}</span>
-      <button class="btn ghost" :disabled="!findCount" title="Previous (⇧↵)" @click="grid?.gotoMatch(-1)"><Icon name="chevD" style="transform: rotate(180deg)" /></button>
+      <button class="btn ghost" :disabled="!findCount" :title="kbd('Previous (⇧↵)')" @click="grid?.gotoMatch(-1)"><Icon name="chevD" style="transform: rotate(180deg)" /></button>
       <button class="btn ghost" :disabled="!findCount" title="Next (↵)" @click="grid?.gotoMatch(1)"><Icon name="chevD" /></button>
       <button class="btn ghost" title="Close (Esc)" @click="closeFind"><Icon name="x" /></button>
     </div>

@@ -1,7 +1,7 @@
 // Shared lazy schema cache (shell agent): schemas, tables and the speed-search index
 // per connection. Used by the sidebar tree and the command palette.
 import { reactive } from "vue";
-import { apiError, schemaApi, type SchemaInfo, type Table } from "@/api";
+import { apiError, schemaApi, type Column, type SchemaInfo, type Table } from "@/api";
 import { useProjectsStore } from "@/stores/projects";
 
 export interface IndexedTable {
@@ -10,15 +10,21 @@ export interface IndexedTable {
   kind: string;
   columns: string[];
   columnsL: string[];
+  /** display types, parallel to columns ("" when the backend sent none) */
+  types: string[];
 }
 
 export const k = (connId: string, schema: string) => `${connId}\u0000${schema}`;
+/** key of one table's column details (cache.columns) */
+export const kt = (connId: string, schema: string, table: string) => `${connId}\u0000${schema}\u0000${table}`;
 
 export const cache = reactive({
   schemas: {} as Record<string, SchemaInfo[]>,
   tables: {} as Record<string, Table[]>,
   /** shallow: replaced wholesale, never mutated */
   index: {} as Record<string, readonly IndexedTable[]>,
+  /** full column details (pk / fk) per table, loaded when the table is expanded in the tree; shallow like index */
+  columns: {} as Record<string, readonly Column[]>,
   loading: {} as Record<string, boolean>,
   errors: {} as Record<string, string>,
 });
@@ -96,12 +102,42 @@ export async function loadIndex(connId: string, schemaIn: string, refresh = fals
         kind: t.kind,
         columns: t.columns,
         columnsL: t.columns.map((c) => c.toLowerCase()),
+        types: t.columns.map((_, i) => t.types?.[i] ?? ""),
       }));
       const frozen = Object.freeze(list);
       if (g === gen(connId)) cache.index[key] = frozen;
       return frozen;
     } catch (e) {
       cache.errors[`i:${key}`] = apiError(e).message;
+      throw e;
+    }
+  });
+}
+
+/** By-name lookup into a schema's index (built once per index array). */
+const byName = new WeakMap<readonly IndexedTable[], Map<string, IndexedTable>>();
+export function indexedTable(connId: string, schema: string, table: string): IndexedTable | undefined {
+  const idx = cache.index[k(connId, schema)];
+  if (!idx) return undefined;
+  let m = byName.get(idx);
+  if (!m) byName.set(idx, (m = new Map(idx.map((t) => [t.name, t]))));
+  return m.get(table);
+}
+
+/** Column details of one table (types, pk, fk) for the tree's column rows. */
+export async function loadColumns(connId: string, schemaIn: string, table: string, refresh = false): Promise<readonly Column[]> {
+  const schema = normSchema(connId, schemaIn);
+  const key = kt(connId, schema, table);
+  if (!refresh && cache.columns[key]) return cache.columns[key];
+  return once(`c:${key}`, async () => {
+    const g = gen(connId);
+    try {
+      const list = Object.freeze((await schemaApi.Columns(connId, schema, table)) ?? []);
+      if (g === gen(connId)) cache.columns[key] = list;
+      delete cache.errors[`c:${key}`];
+      return list;
+    } catch (e) {
+      cache.errors[`c:${key}`] = apiError(e).message;
       throw e;
     }
   });
@@ -115,6 +151,8 @@ export function invalidate(connId: string) {
   delete cache.errors[connId];
   for (const key of Object.keys(cache.tables)) if (key.startsWith(connId + "\u0000")) delete cache.tables[key];
   for (const key of Object.keys(cache.index)) if (key.startsWith(connId + "\u0000")) delete cache.index[key];
+  for (const key of Object.keys(cache.columns)) if (key.startsWith(connId + "\u0000")) delete cache.columns[key];
+  for (const key of Object.keys(cache.errors)) if (key.startsWith(`c:${connId}\u0000`)) delete cache.errors[key];
 }
 
 export function quoteIdent(driver: string, name: string): string {

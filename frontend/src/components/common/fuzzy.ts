@@ -146,7 +146,8 @@ export interface TableMatch {
   column?: string;
 }
 
-function jumps(pos: number[]): number {
+/** Number of gaps between matched runs (0 = one contiguous run). */
+export function jumps(pos: number[]): number {
   let j = 0;
   for (let i = 1; i < pos.length; i++) if (pos[i] !== pos[i - 1] + 1) j++;
   return j;

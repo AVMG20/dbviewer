@@ -3,6 +3,7 @@
 // overlays. Global shortcuts live here; view-local shortcuts live in the views and
 // only fire when their tab is active.
 import { computed, onBeforeUnmount, onMounted, watch } from "vue";
+import { kbd } from "@/lib/kbd";
 import { useProjectsStore } from "@/stores/projects";
 import { useTabsStore } from "@/stores/tabs";
 import { useUiStore } from "@/stores/ui";
@@ -14,6 +15,9 @@ import ConnectionModal from "@/components/connection/ConnectionModal.vue";
 import ConfirmModal from "@/components/common/ConfirmModal.vue";
 import PasswordModal from "@/components/common/PasswordModal.vue";
 import PassphraseModal from "@/components/common/PassphraseModal.vue";
+import SettingsModal from "@/components/common/SettingsModal.vue";
+import ShortcutsModal from "@/components/common/ShortcutsModal.vue";
+import { loadRecent, pruneRecent, pushRecent } from "@/lib/recent";
 import Modal from "@/components/common/Modal.vue";
 import Toasts from "@/components/common/Toasts.vue";
 import Icon from "@/components/common/Icon.vue";
@@ -42,6 +46,18 @@ function accentOf(connId: string): string | undefined {
 
 registerDataModals();
 ui.registerModal("passphrase", PassphraseModal);
+ui.registerModal("settings", SettingsModal);
+ui.registerModal("shortcuts", ShortcutsModal);
+
+// Recently opened tables (empty Cmd+K lists them first).
+watch(() => projects.activeProjectId, (id) => id && void loadRecent(id), { immediate: true });
+watch(
+  () => tabs.active,
+  (t) => {
+    if (t?.table && (t.kind === "table" || t.kind === "structure")) pushRecent({ kind: t.kind, connId: t.connId, schema: t.schema ?? "", table: t.table });
+  },
+);
+watch(() => projects.connections.length, () => pruneRecent((id) => !!projects.getConnection(id)));
 
 
 onMounted(async () => {
@@ -82,7 +98,24 @@ function onKeyCapture(e: KeyboardEvent) {
     ui.togglePalette();
     return;
   }
+  // Zoom works everywhere, also with a dialog open.
+  if (mod && !e.altKey && (e.key === "=" || e.key === "+")) return void (e.preventDefault(), ui.zoomIn());
+  if (mod && !e.altKey && (e.key === "-" || e.key === "_")) return void (e.preventDefault(), ui.zoomOut());
+  if (mod && !e.altKey && !e.shiftKey && e.key === "0") return void (e.preventDefault(), ui.zoomReset());
   if (ui.overlayOpen) return; // dialogs, palette and <Modal>s own the keyboard
+  if (mod && !e.altKey && !e.shiftKey && e.key === ",") {
+    e.preventDefault();
+    e.stopPropagation();
+    ui.openModal("settings");
+    return;
+  }
+  const inText = !!(e.target as HTMLElement | null)?.closest("input, textarea, select, [contenteditable='true'], .cm-editor");
+  if ((mod && !e.altKey && e.key === "/") || (e.key === "?" && !mod && !e.altKey && !inText)) {
+    e.preventDefault();
+    e.stopPropagation();
+    ui.openModal("shortcuts");
+    return;
+  }
   if (mod && !e.altKey && !e.shiftKey && key === "t") {
     e.preventDefault();
     e.stopPropagation();
@@ -168,15 +201,21 @@ function onContext(e: MouseEvent) {
       class="drag relative flex flex-none items-center border-b border-bd bg-bg2"
       :style="{ height: 'var(--titlebar-h)', paddingLeft: 'var(--traffic-w)' }"
     >
-      <button class="btn ghost no-drag" :title="'Toggle sidebar (⌘B)'" @click="ui.toggleSidebar()"><Icon name="sidebar" :size="14" /></button>
+      <button class="btn ghost no-drag" :title="kbd('Toggle sidebar (⌘B)')" @click="ui.toggleSidebar()"><Icon name="sidebar" :size="14" /></button>
       <div class="pointer-events-none absolute inset-x-0 text-center dim" :style="{ paddingLeft: '200px', paddingRight: '200px' }">
         <span class="block truncate">{{ titleText }}</span>
       </div>
       <div class="flex-1" />
       <div class="no-drag flex items-center gap-1 pr-3">
-        <button class="btn ghost" @click="ui.openPalette()"><Icon name="search" /> Jump to <kbd>⌘K</kbd></button>
+        <button class="btn ghost" @click="ui.openPalette()"><Icon name="search" /> Jump to <kbd>{{ kbd("⌘K") }}</kbd></button>
         <button class="btn ghost" :title="`Theme: ${ui.theme} (click to cycle: system, dark, light)`" @click="ui.cycleTheme()">
           <Icon :name="themeIcon" :size="14" />
+        </button>
+        <button class="btn ghost" :title="kbd('Keyboard shortcuts (⌘/)')" aria-label="Keyboard shortcuts" @click="ui.openModal('shortcuts')">
+          <Icon name="keyboard" :size="14" />
+        </button>
+        <button class="btn ghost" :title="kbd('Settings (⌘,)')" aria-label="Settings" @click="ui.openModal('settings')">
+          <Icon name="gear" :size="14" />
         </button>
       </div>
     </header>
@@ -187,19 +226,19 @@ function onContext(e: MouseEvent) {
         <TabBar />
         <div class="relative min-h-0 flex-1">
           <template v-for="t in tabs.tabs" :key="t.id">
-            <div v-show="t.id === tabs.activeId" data-tab-view :data-active="t.id === tabs.activeId" class="absolute inset-0 flex flex-col" :data-accent="accentOf(t.connId)">
+            <div v-show="t.id === tabs.activeId" data-tab-view :data-tab-id="t.id" :data-active="t.id === tabs.activeId" class="absolute inset-0 flex flex-col" :data-accent="accentOf(t.connId)">
               <TableView v-if="t.kind === 'table'" :tab="t" :active="t.id === tabs.activeId" />
               <SqlConsole v-else-if="t.kind === 'console'" :tab="t" :active="t.id === tabs.activeId" />
               <StructureView v-else-if="t.kind === 'structure'" :tab="t" :active="t.id === tabs.activeId" />
             </div>
           </template>
           <div v-if="!tabs.tabs.length" class="flex h-full flex-col items-center justify-center gap-3 text-center">
-            <div class="dim">Open a table from the sidebar, or jump to anything with <kbd>⌘K</kbd>.</div>
+            <div class="dim">Open a table from the sidebar, or jump to anything with <kbd>{{ kbd("⌘K") }}</kbd>.</div>
             <div class="flex gap-2">
               <button class="btn" @click="ui.openPalette()"><Icon name="search" /> Jump to…</button>
               <button class="btn" @click="ui.openModal('connection', { projectId: projects.activeProjectId })"><Icon name="plus" /> New connection</button>
             </div>
-            <div class="dim text-[11px]">In the sidebar, just start typing to search tables and columns.</div>
+            <div class="dim text-[11px]">In the sidebar, just start typing to search tables and columns. Press <kbd>{{ kbd("⌘/") }}</kbd> for all shortcuts.</div>
           </div>
         </div>
       </main>

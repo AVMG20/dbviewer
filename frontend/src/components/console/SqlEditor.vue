@@ -4,9 +4,9 @@
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Compartment, EditorState, Prec } from "@codemirror/state";
 import { EditorView, drawSelection, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers, placeholder } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, indentWithTab, isolateHistory } from "@codemirror/commands";
 import { HighlightStyle, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
-import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, type Completion, type CompletionContext } from "@codemirror/autocomplete";
+import { acceptCompletion, autocompletion, closeBrackets, closeCompletion, closeBracketsKeymap, completionKeymap, type Completion, type CompletionContext } from "@codemirror/autocomplete";
 import { MariaSQL, MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { appHighlight, appTheme } from "./cmTheme";
@@ -26,6 +26,7 @@ const emit = defineEmits<{
   run: [];
   "run-all": [];
   "save-query": [];
+  format: [];
 }>();
 
 const host = ref<HTMLElement | null>(null);
@@ -111,9 +112,11 @@ onMounted(() => {
           keymap.of([
             // Tab accepts an open completion; otherwise falls through to indentWithTab
             { key: "Tab", run: acceptCompletion },
-            { key: "Mod-Enter", run: () => (emit("run"), true) },
-            { key: "Mod-Shift-Enter", run: () => (emit("run-all"), true) },
+            // running closes an open completion list (it would float over a confirmation dialog)
+            { key: "Mod-Enter", run: (v) => (closeCompletion(v), emit("run"), true) },
+            { key: "Mod-Shift-Enter", run: (v) => (closeCompletion(v), emit("run-all"), true) },
             { key: "Mod-s", run: () => (emit("save-query"), true) },
+            { key: "Alt-Shift-f", run: () => (emit("format"), true) },
           ]),
         ),
         props.lineNumbers === false ? [] : [lineNumbers(), highlightActiveLineGutter()],
@@ -155,6 +158,17 @@ defineExpose({
     return { doc: s.doc.toString(), from: r.from, to: r.to, selected: s.sliceDoc(r.from, r.to), cursor: r.head };
   },
   setDoc: (text: string) => view?.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } }),
+  /** Replaces from..to as its own undo step (Format) and sets the selection. */
+  replaceRange: (from: number, to: number, text: string, anchor: number, head = anchor) => {
+    if (!view) return;
+    view.dispatch({
+      changes: { from, to, insert: text },
+      selection: { anchor, head },
+      annotations: isolateHistory.of("full"),
+      userEvent: "input.format",
+      scrollIntoView: true,
+    });
+  },
   insertAtCursor: (text: string) => {
     if (!view) return;
     const r = view.state.selection.main;

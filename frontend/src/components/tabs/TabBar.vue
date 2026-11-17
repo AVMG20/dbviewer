@@ -1,7 +1,10 @@
 <script setup lang="ts">
 // Tab bar (shell agent): tabs with connection color stripe, kind icon, dirty / pending
 // badge, close button, drag reorder, context menu; plus the connection context bar below.
+// Console tabs can be renamed: double-click or "Rename…" edits the title inline (Enter saves, Esc cancels;
+// an empty name restores automatic naming, see tabs.rename / tabs.autoTitle).
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { kbd } from "@/lib/kbd";
 import { useChangesStore } from "@/stores/changes";
 import { useProjectsStore } from "@/stores/projects";
 import { useTabsStore } from "@/stores/tabs";
@@ -71,6 +74,41 @@ function onTabClick(e: MouseEvent, t: Tab) {
   else tabs.activate(t.id, { focus: true });
 }
 
+// ---- rename (console tabs) ----------------------------------------------------------
+const renaming = ref<string | null>(null);
+const renameText = ref("");
+async function startRename(t: Tab) {
+  if (t.kind !== "console") return;
+  renaming.value = t.id;
+  renameText.value = t.title;
+  await nextTick();
+  revealActive();
+  const el = strip.value?.querySelector<HTMLInputElement>("input.rename");
+  el?.focus();
+  el?.select();
+}
+function endRename(save: boolean) {
+  const id = renaming.value;
+  if (!id) return;
+  renaming.value = null;
+  if (save) tabs.rename(id, renameText.value);
+  if (id === tabs.activeId) ui.focusActiveView();
+}
+function onRenameKey(e: KeyboardEvent) {
+  e.stopPropagation();
+  if (e.key === "Enter") {
+    e.preventDefault();
+    endRename(true);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    endRename(false);
+  }
+}
+function onTabDblClick(t: Tab) {
+  if (t.kind === "console") void startRename(t);
+  else tabs.promote(t.id);
+}
+
 // ---- mouse ------------------------------------------------------------------------
 function onAuxClick(e: MouseEvent, t: Tab) {
   if (e.button === 1) {
@@ -90,12 +128,15 @@ function measure() {
 }
 function revealActive() {
   const el = strip.value;
-  const t = el?.querySelector<HTMLElement>("[data-active=true]");
+  const t = el?.querySelector<HTMLElement>('.tab[data-active="true"]');
   if (!el || !t) return;
-  const left = t.offsetLeft;
-  const right = left + t.offsetWidth;
+  // measured from the rendered boxes (offsetLeft depends on the offsetParent chain)
+  const box = el.getBoundingClientRect();
+  const r = t.getBoundingClientRect();
+  const left = r.left - box.left + el.scrollLeft;
+  const right = left + r.width;
   if (left < el.scrollLeft + 8) el.scrollLeft = Math.max(0, left - 24);
-  else if (right > el.scrollLeft + el.clientWidth - 8) el.scrollLeft = right - el.clientWidth + 24;
+  else if (right > el.scrollLeft + el.clientWidth - 8) el.scrollLeft = Math.min(right - el.clientWidth + 24, el.scrollWidth - el.clientWidth);
 }
 let ro: ResizeObserver | null = null;
 onMounted(() => {
@@ -109,8 +150,9 @@ onMounted(() => {
   measure();
 });
 onBeforeUnmount(() => ro?.disconnect());
+// also when tabs are reordered / renamed / pinned (the active tab may move or grow off-screen)
 watch(
-  () => [tabs.activeId, tabs.tabs.length] as const,
+  () => [tabs.activeId, tabs.tabs.map((t) => `${t.id}\u0000${t.title}\u0000${t.pinned ? 1 : 0}`).join("\u0001")] as const,
   async () => {
     await nextTick();
     measure();
@@ -168,12 +210,13 @@ const menuItems = computed<MenuItem[]>(() => {
   if (!t) return [];
   const i = tabs.tabs.findIndex((x) => x.id === t.id);
   return [
-    { id: "close", label: "Close", hint: "⌘W" },
+    { id: "close", label: "Close", hint: kbd("⌘W") },
     { id: "others", label: "Close others", disabled: tabs.tabs.length < 2 },
     { id: "right", label: "Close to the right", disabled: i >= tabs.tabs.length - 1 },
     { id: "all", label: "Close all" },
     { separator: true },
     { id: "pin", label: t.pinned ? "Unpin" : "Pin" },
+    ...(t.kind === "console" ? [{ id: "rename", label: "Rename…" }] : []),
     ...(t.kind === "table" ? [{ id: "structure", label: "Open structure" }] : []),
     ...(t.kind === "structure" ? [{ id: "data", label: "Open data" }] : []),
     { id: "reveal", label: "Reveal in sidebar" },
@@ -192,6 +235,10 @@ async function runMenu(id: string) {
   } else if (id === "all") {
     for (const o of [...tabs.tabs]) if (!o.pinned) await tabs.close(o.id);
   } else if (id === "pin") tabs.update(t.id, { pinned: !t.pinned });
+  else if (id === "rename") {
+    tabs.activate(t.id);
+    setTimeout(() => void startRename(t)); // after the menu closed and restored focus
+  }
   else if (id === "structure" && t.table) tabs.openStructure(t.connId, t.schema ?? "", t.table);
   else if (id === "data" && t.table) tabs.openTable(t.connId, t.schema ?? "", t.table);
   else if (id === "reveal") ui.revealInSidebar(t.connId, t.schema, t.table);
@@ -214,9 +261,9 @@ async function runMenu(id: string) {
           role="tab"
           :aria-selected="t.id === tabs.activeId"
           :title="`${t.title}${connOf(t) ? ' — ' + connOf(t)!.name : ''}`"
-          draggable="true"
+          :draggable="renaming !== t.id"
           @click="onTabClick($event, t)"
-          @dblclick="tabs.promote(t.id)"
+          @dblclick="onTabDblClick(t)"
           @mousedown.middle.prevent
           @auxclick="onAuxClick($event, t)"
           @contextmenu.prevent="menu = { x: $event.clientX, y: $event.clientY, tab: t }"
@@ -227,17 +274,21 @@ async function runMenu(id: string) {
         >
           <span class="conn-dot" />
           <Icon :name="icon[t.kind]" class="dim" />
-          <span class="title truncate" :class="{ mono: t.kind !== 'console', preview: t.preview }">{{ t.title }}</span>
+          <input
+            v-if="renaming === t.id" v-model="renameText" class="rename" spellcheck="false" aria-label="Tab name"
+            @keydown="onRenameKey" @blur="endRename(true)" @click.stop @dblclick.stop @mousedown.stop
+          />
+          <span v-else class="title truncate" :class="{ mono: t.kind !== 'console', preview: t.preview }">{{ t.title }}</span>
           <span v-if="connOf(t)?.readOnly" :class="isRed(t) ? 'text-danger' : 'dim'" title="Read-only"><Icon name="lock" :size="10" /></span>
           <span v-if="pending(t) > 0" class="bdg" :title="`${pending(t)} pending change(s)`">{{ pending(t) }}</span>
           <span v-else-if="t.dirty" class="dirty" title="Unsaved changes" />
-          <button class="x" tabindex="-1" :title="'Close (⌘W)'" @click.stop="tabs.close(t.id)"><Icon name="x" :size="10" /></button>
+          <button class="x" tabindex="-1" :title="kbd('Close (⌘W)')" @click.stop="tabs.close(t.id)"><Icon name="x" :size="10" /></button>
         </div>
       </div>
       <button v-if="overflowing" class="btn ghost icon no-drag !my-[2px] flex-none" title="All tabs" aria-label="All tabs" @click="openList">
         <Icon name="chev" class="rotate-90" />
       </button>
-      <button class="btn ghost no-drag !mx-1 !my-[3px] flex-none" title="New SQL console (⌘T)" @click="newConsole">
+      <button class="btn ghost no-drag !mx-1 !my-[3px] flex-none" :title="kbd('New SQL console (⌘T)')" @click="newConsole">
         <Icon name="plus" /> SQL
       </button>
     </div>
@@ -288,6 +339,10 @@ async function runMenu(id: string) {
 .tab.over { box-shadow: inset 2px 0 0 var(--ac); }
 .tab.dragging { opacity: .5; }
 .title { min-width: 0; }
+.rename {
+  min-width: 0; width: 100%; height: 18px; padding: 0 4px; border: 1px solid var(--ac); border-radius: 3px;
+  background: var(--bg); color: var(--tx); font: inherit; outline: none;
+}
 .title.preview, .preview { font-style: italic; }
 .tablist {
   position: fixed; width: 300px; padding: 6px; border: 1px solid var(--bd2); border-radius: 10px; background: var(--pop);

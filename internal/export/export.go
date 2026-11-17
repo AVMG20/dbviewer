@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -87,7 +88,11 @@ func Export(ctx context.Context, p *conn.Pool, req model.ExportRequest, cols []m
 	}
 
 	var n, written int64
-	err := p.Read(ctx, true, func(qr conn.Querier) error {
+	read := func(fn func(conn.Querier) error) error { return p.Read(ctx, true, fn) }
+	if req.Page == nil && req.Schema != "" {
+		read = func(fn func(conn.Querier) error) error { return readInSchema(ctx, p, req.Schema, fn) }
+	}
+	err := read(func(qr conn.Querier) error {
 		rows, err := qr.QueryContext(ctx, q, args...)
 		if err != nil {
 			return err
@@ -167,6 +172,48 @@ func Export(ctx context.Context, p *conn.Pool, req model.ExportRequest, cols []m
 	res.Rows, res.Bytes = n, written
 	res.DurationMs = time.Since(start).Milliseconds()
 	return res, nil
+}
+
+// readInSchema runs fn like p.Read(ctx, true, fn), with schema as the default
+// schema for unqualified names (SQL sources, the console tab's schema). Postgres:
+// SET LOCAL search_path inside the (always rolled back) read-only transaction.
+// MySQL: USE on a dedicated connection that is discarded afterwards, so the
+// pool's connections keep their database. SQLite has a single schema namespace.
+func readInSchema(ctx context.Context, p *conn.Pool, schema string, fn func(conn.Querier) error) error {
+	switch p.Config.Driver {
+	case model.DriverPostgres:
+		return p.Read(ctx, true, func(qr conn.Querier) error {
+			ex, ok := qr.(interface {
+				ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+			})
+			if !ok {
+				return fmt.Errorf("cannot set the schema")
+			}
+			if _, err := ex.ExecContext(ctx, "SET LOCAL search_path TO "+p.Driver.QuoteIdent(schema)); err != nil {
+				return err
+			}
+			return fn(qr)
+		})
+	case model.DriverMySQL:
+		c, err := p.DB.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_ = c.Raw(func(any) error { return driver.ErrBadConn }) // never reuse: USE changed it
+			_ = c.Close()
+		}()
+		if _, err := c.ExecContext(ctx, p.Driver.UseSchema(schema)); err != nil {
+			return err
+		}
+		tx, err := c.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		return fn(tx)
+	}
+	return p.Read(ctx, true, fn)
 }
 
 func validFormat(f string) bool {

@@ -4,6 +4,7 @@
 // them), copy/paste, context menu, resizable columns, quick-find highlighting.
 // Used by TableView (editable) and SqlConsole results (read-only).
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
+import { kbd } from "@/lib/kbd";
 import { useVirtualizer } from "@tanstack/vue-virtual";
 import type { CellValue, Driver, ResultColumn } from "@/api";
 import { isBinary, isLongText, SQL_DEFAULT } from "@/api";
@@ -14,15 +15,15 @@ import { toastOnce } from "@/lib/notify";
 import { formatCopy, type CopyFormatId } from "@/lib/copyFormats";
 import { PASTE_DEFAULT, PASTE_NULL, parseDelimited } from "@/lib/delimited";
 import {
-  cellEquals, cellText, coerceInput, isBlankInvalid, isDefaultValue, measureText, minifyJson, needsPopover, NON_TEXT,
+  cellEquals, cellText, coerceInput, isBlankInvalid, isDefaultValue, isNumericKind, measureText, minifyJson, needsPopover, NON_TEXT,
   renderCell, searchText, validateInput, type Rendered,
 } from "@/lib/format";
 import type { AppliedEdits, CellEdit, CopyContext, GridRow, MenuItem, SelectionInfo, SortSpec } from "@/lib/gridTypes";
 import CellPopover from "./CellPopover.vue";
+import { rowHeight as rowH, settings } from "@/lib/settings";
 import ContextMenu from "@/components/common/ContextMenu.vue";
 import Icon from "@/components/common/Icon.vue";
 
-const ROW_H = 22;
 const HEADER_H = 26;
 
 const props = withDefaults(
@@ -122,7 +123,7 @@ const rowVirt = useVirtualizer(
   computed(() => ({
     count: props.rows.length,
     getScrollElement: () => scroller.value,
-    estimateSize: () => ROW_H,
+    estimateSize: () => rowH(),
     overscan: 10,
     paddingStart: HEADER_H,
   })),
@@ -273,7 +274,67 @@ watch([ranges, active], () => {
     cellCount: uniqueCellCount(),
   };
   emit("selection", info);
+  scheduleStats();
 });
+
+// ---- selection aggregates (status bar: count / sum / avg / min / max) ----------------
+/** Id of the tab this grid lives in (App.vue marks each tab view with data-tab-id). */
+function ownTabId(): string {
+  return (root.value?.closest("[data-tab-view]") as HTMLElement | null)?.dataset.tabId ?? "";
+}
+let statsTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleStats() {
+  clearTimeout(statsTimer);
+  statsTimer = setTimeout(computeStats, 60);
+}
+const STATS_MAX_CELLS = 500_000;
+function computeStats() {
+  const tabId = ownTabId();
+  const rs = ranges.value;
+  const cells = uniqueCellCount();
+  if (!tabId || cells < 2 || cells > STATS_MAX_CELLS) {
+    if (ui.selectionStats?.tabId === tabId) ui.setSelectionStats(null);
+    return;
+  }
+  const n = nCols.value;
+  const seen = rs.length > 1 ? new Set<number>() : null;
+  let values = 0, numbers = 0, sum = 0, min = Infinity, max = -Infinity;
+  for (const g of rs) {
+    for (let r = g.r1; r <= g.r2; r++) {
+      const row = props.rows[r];
+      if (!row) continue;
+      for (let c = g.c1; c <= g.c2; c++) {
+        if (seen) {
+          const k = r * n + c;
+          if (seen.has(k)) continue;
+          seen.add(k);
+        }
+        const v = row.values[c];
+        if (v === null || v === undefined || isDefaultValue(v)) continue;
+        values++;
+        if (!isNumericKind(props.columns[c]?.kind ?? "")) continue;
+        const x = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+        if (!Number.isFinite(x)) continue;
+        numbers++;
+        sum += x;
+        if (x < min) min = x;
+        if (x > max) max = x;
+      }
+    }
+  }
+  ui.setSelectionStats(
+    numbers ? { tabId, cells, values, numbers, sum, avg: sum / numbers, min, max } : { tabId, cells, values, numbers },
+  );
+}
+// rows edited / reloaded under an unchanged selection
+watch(() => props.rows, scheduleStats);
+onBeforeUnmount(() => {
+  clearTimeout(statsTimer);
+  const id = ownTabId();
+  if (id && ui.selectionStats?.tabId === id) ui.setSelectionStats(null);
+});
+// density changed: re-measure the virtual rows
+watch(() => settings.density, () => rowVirt.value.measure());
 watch(
   () => props.rows.length,
   (n) => {
@@ -295,16 +356,37 @@ watch(colSig, () => {
 function revealCell(r: number, c: number) {
   const s = scroller.value;
   if (!s) return;
-  const top = HEADER_H + r * ROW_H;
+  const top = HEADER_H + r * rowH();
   if (top < s.scrollTop + HEADER_H) s.scrollTop = top - HEADER_H;
-  else if (top + ROW_H > s.scrollTop + s.clientHeight) s.scrollTop = top + ROW_H - s.clientHeight;
+  else if (top + rowH() > s.scrollTop + s.clientHeight) s.scrollTop = top + rowH() - s.clientHeight;
   const left = colStarts.value[c] ?? 0;
   const w = widths.value[c] ?? 100;
   if (left < s.scrollLeft + rnW.value) s.scrollLeft = left - rnW.value;
   else if (left + w > s.scrollLeft + s.clientWidth) s.scrollLeft = left + w - s.clientWidth;
 }
+/** Row indexes of the selected cells in column c (for "Filter IN selected values"). */
+function selectedRowsInColumn(c: number): number[] {
+  const out = new Set<number>();
+  for (const g of ranges.value) if (c >= g.c1 && c <= g.c2) for (let r = g.r1; r <= g.r2; r++) out.add(r);
+  return [...out].sort((a, b) => a - b);
+}
+/** Selects column c and scrolls it into view (palette / sidebar column jumps). */
+function focusColumn(c: number) {
+  if (c < 0 || c >= nCols.value) return;
+  if (props.rows.length) selectColumn(c, false);
+  else active.value = null;
+  const s = scroller.value;
+  if (s) {
+    const left = colStarts.value[c] ?? 0;
+    const w = widths.value[c] ?? 100;
+    // center the column when it is off-screen
+    if (left < s.scrollLeft + rnW.value || left + w > s.scrollLeft + s.clientWidth) s.scrollLeft = Math.max(0, left - (s.clientWidth - w) / 2);
+    s.scrollTop = 0;
+  }
+  focus();
+}
 function visibleRows(): number {
-  return Math.max(1, Math.floor(((scroller.value?.clientHeight ?? 400) - HEADER_H) / ROW_H) - 1);
+  return Math.max(1, Math.floor(((scroller.value?.clientHeight ?? 400) - HEADER_H) / rowH()) - 1);
 }
 
 // ---- mouse ------------------------------------------------------------------
@@ -314,7 +396,7 @@ function pointToCell(clientX: number, clientY: number): { r: number; c: number }
   const rect = s.getBoundingClientRect();
   const x = clientX - rect.left + s.scrollLeft;
   const y = clientY - rect.top + s.scrollTop - HEADER_H;
-  const r = Math.max(0, Math.min(props.rows.length - 1, Math.floor(y / ROW_H)));
+  const r = Math.max(0, Math.min(props.rows.length - 1, Math.floor(y / rowH())));
   const starts = colStarts.value;
   let lo = 0;
   let hi = starts.length - 1;
@@ -436,7 +518,7 @@ function headerMenu(ci: number): MenuItem[] {
     { label: "Sort descending", run: () => emit("sort-set", ci, "desc", false) },
     { label: "Clear sort", disabled: !s, run: () => emit("sort-set", ci, null, false) },
     { separator: true },
-    { label: "Select column", hint: "⌥-click", run: () => selectColumn(ci, false) },
+    { label: "Select column", hint: kbd("⌥-click"), run: () => selectColumn(ci, false) },
     { label: "Cmd+Shift-click multi-selects key cells", disabled: true },
     { label: "Copy column", run: () => { selectColumn(ci, false); void copy("tsv"); } },
     { label: "Copy column name", run: () => void copyText(c.name) },
@@ -707,7 +789,7 @@ function popoverAnchor(): { x: number; y: number } {
   const rect = s.getBoundingClientRect();
   return {
     x: rect.left + (colStarts.value[e.col] ?? 0) - s.scrollLeft,
-    y: rect.top + HEADER_H + (e.row + 1) * ROW_H - s.scrollTop + 2,
+    y: rect.top + HEADER_H + (e.row + 1) * rowH() - s.scrollTop + 2,
   };
 }
 
@@ -1042,7 +1124,7 @@ async function cut() {
 async function paste(textArg?: string) {
   if (!props.editable) return emit("edit-blocked");
   const text = textArg ?? (await readClipboardText());
-  if (text === null) return toastOnce("Could not read the clipboard. Use ⌘V with the grid focused.", "warning");
+  if (text === null) return toastOnce(kbd("Could not read the clipboard. Use ⌘V with the grid focused."), "warning");
   if (text === "") return;
   const m = parseDelimited(text);
   if (!ranges.value.length && !active.value) return ui.toast("Select a cell to paste into", "info");
@@ -1232,12 +1314,13 @@ defineExpose({
   gotoMatch, scrollToTop: () => scroller.value && (scroller.value.scrollTop = 0), clearSelection,
   activeCell: () => (active.value ? { row: active.value.r, col: active.value.c } : null),
   viewValue: (r: number, c: number) => openPopover(r, c, false),
+  selectedRowsInColumn, focusColumn,
 });
 
 const editStyle = computed(() => {
   const e = editing.value;
   if (!e || e.popover) return null;
-  return { left: (colStarts.value[e.col] ?? 0) + "px", top: HEADER_H + e.row * ROW_H + "px", width: Math.max(widths.value[e.col] ?? 100, 90) + "px", height: ROW_H + "px" };
+  return { left: (colStarts.value[e.col] ?? 0) + "px", top: HEADER_H + e.row * rowH() + "px", width: Math.max(widths.value[e.col] ?? 100, 90) + "px", height: rowH() + "px" };
 });
 const popTitle = computed(() => (editing.value ? props.columns[editing.value.col]?.name ?? "" : ""));
 const filteredSet = computed(() => new Set(props.filteredCols));
@@ -1298,7 +1381,7 @@ const filteredSet = computed(() => new Set(props.filteredCols));
           v-for="vr in rowItems" :key="String(vr.key)"
           class="dg-row"
           :class="{ 'r-new': rows[vr.index]?.state === 'new', 'r-del': rows[vr.index]?.state === 'deleted', 'r-chg': rows[vr.index]?.changed?.some(Boolean) }"
-          :style="{ top: vr.start + 'px', height: ROW_H + 'px', width: totalW + 'px' }"
+          :style="{ top: vr.start + 'px', height: rowH() + 'px', width: totalW + 'px' }"
         >
           <template v-if="rows[vr.index]">
             <div
@@ -1351,7 +1434,7 @@ const filteredSet = computed(() => new Set(props.filteredCols));
         >→ {{ editing.multi }} cells</div>
         <div
           v-if="editing && !editing.popover && editStyle && (editError || editPkWarning) && !editing.multi" class="dg-edit-msg" :class="{ err: !!editError }"
-          :style="{ left: editStyle.left, top: HEADER_H + (editing.row + 1) * ROW_H + 2 + 'px' }"
+          :style="{ left: editStyle.left, top: HEADER_H + (editing.row + 1) * rowH() + 2 + 'px' }"
         >{{ editError || editPkWarning }}</div>
         <div v-if="!rows.length && !loading" class="dg-empty dim" :style="{ top: HEADER_H + 24 + 'px' }">{{ emptyText }}</div>
         <div v-if="!rows.length && loading" class="dg-skel" :style="{ top: HEADER_H + 'px' }">

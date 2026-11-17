@@ -2,6 +2,8 @@
 // Registered as the "export" modal. Scope: current page / selection (client side, browser download or
 // clipboard) or all rows (backend Export: native save dialog, typed path fallback in the browser).
 // ui.openModal("export", { connId, schema, table, page, hasSelection, loadedRows, getText })
+// Console results pass `sql` (the result's statement) instead of `page`: "All rows" re-runs the query
+// in the backend (read statements only) and streams it to the file; `table` names the INSERT target.
 import { onBeforeUnmount, ref } from "vue";
 import { apiError, dataApi, type PageRequest } from "@/api";
 import Modal from "@/components/common/Modal.vue";
@@ -11,7 +13,7 @@ import { FORMAT_FILE } from "@/lib/copyFormats";
 import { fmtNum } from "@/lib/format";
 
 const props = defineProps<{
-  connId: string; schema: string; table: string; page: PageRequest;
+  connId: string; schema: string; table: string; page?: PageRequest; sql?: string;
   hasSelection?: boolean; loadedRows?: number;
   getText?: (scope: "page" | "selection", format: string, header: boolean) => Promise<string | null> | string | null;
 }>();
@@ -43,8 +45,7 @@ async function run() {
   try {
     const p = dataApi.Export({
       connId: props.connId,
-      page: { ...props.page, offset: 0, limit: 0 },
-      sql: "",
+      ...(props.sql ? { sql: props.sql, schema: props.schema } : { page: { ...props.page!, offset: 0, limit: 0 }, sql: "", schema: "" }),
       format: format.value,
       path: path.value,
       includeHeader: header.value,
@@ -61,7 +62,8 @@ async function run() {
     const err = apiError(e);
     if (err.code === "canceled") return;
     error.value = err.code === "not_implemented" ? "Export is not implemented in the backend yet. Use “Current page” instead." : err.message || err.code;
-    if (!path.value && err.code !== "not_implemented" && err.code !== "db_error") needsPath.value = true;
+    if (props.sql && err.code === "invalid_argument" && /statement/i.test(err.message)) error.value += "\n\nUse “Loaded rows” to export the rows shown in the console.";
+    else if (!path.value && err.code !== "not_implemented" && err.code !== "db_error") needsPath.value = true;
   } finally {
     inflight = null;
     busy.value = false;
@@ -92,9 +94,9 @@ async function clientExport(copy: boolean) {
   <Modal title="Export" :width="520" @close="ui.closeModal()">
     <div class="fr"><span class="dim">Scope</span>
       <div class="flex flex-col gap-1">
-        <label class="flex items-center gap-2"><input v-model="scope" type="radio" value="page" /> Current page <span class="dim">({{ fmtNum(loadedRows ?? 0) }} loaded rows)</span></label>
+        <label class="flex items-center gap-2"><input v-model="scope" type="radio" value="page" /> {{ sql ? "Loaded rows" : "Current page" }} <span class="dim">({{ fmtNum(loadedRows ?? 0) }} loaded rows)</span></label>
         <label class="flex items-center gap-2" :class="{ dim: !hasSelection }"><input v-model="scope" type="radio" value="selection" :disabled="!hasSelection" /> Selection</label>
-        <label class="flex items-center gap-2"><input v-model="scope" type="radio" value="all" /> All rows <span class="dim">(whole filtered table, streamed by the backend)</span></label>
+        <label class="flex items-center gap-2"><input v-model="scope" type="radio" value="all" /> All rows <span class="dim">{{ sql ? "(re-runs the query, streamed by the backend)" : "(whole filtered table, streamed by the backend)" }}</span></label>
       </div>
     </div>
     <div class="fr"><span class="dim">Format</span>

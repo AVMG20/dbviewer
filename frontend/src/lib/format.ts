@@ -1,6 +1,7 @@
 // Cell value formatting, parsing and comparison (data agent).
 import type { CellValue, DefaultValue, ResultColumn, ValueKind } from "@/api";
 import { isBinary, isLongText } from "@/api";
+import { nullText, settings } from "@/lib/settings";
 
 export interface Rendered {
   text: string;
@@ -27,9 +28,23 @@ export function formatSize(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-const ISO_T = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d:\d\d(?:\.\d+)?)(Z|[+-]\d\d:?\d\d)?$/;
+const ISO_T = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d(?:\.\d+)?)(Z|[+-]\d\d:?\d\d)?$/;
 
-function formatDateTime(s: string): string {
+const DATE_ONLY = /^(\d{4})-(\d\d)-(\d\d)$/;
+
+/** Display text of a date/time value; "local" uses the OS format, "iso" the stored form. */
+function formatDateTime(s: string, kind: string): string {
+  if (settings.dateStyle === "local") {
+    const d = DATE_ONLY.exec(s);
+    if (d && kind === "date") return new Date(+d[1], +d[2] - 1, +d[3]).toLocaleDateString();
+    const m = ISO_T.exec(s);
+    if (m && kind !== "time") {
+      // without a zone the value is wall-clock time: show it as such, not converted
+      const zone = !m[3] || m[3] === "Z" ? (m[3] ?? "") : m[3].replace(/^([+-]\d\d):?(\d\d)$/, "$1:$2");
+      const t = new Date(`${m[1]}T${m[2]}${zone}`);
+      if (!isNaN(t.getTime())) return t.toLocaleString();
+    }
+  }
   const m = ISO_T.exec(s);
   if (!m) return s;
   const time = m[2].replace(/\.0+$/, "");
@@ -41,7 +56,7 @@ const MAX_DISPLAY = 400;
 
 /** What a cell shows in the grid. */
 export function renderCell(v: CellValue | undefined, col: ResultColumn): Rendered {
-  if (v === null || v === undefined) return { text: "NULL", cls: "null", truncated: false, num: false };
+  if (v === null || v === undefined) return { text: nullText(), cls: "null", truncated: false, num: false };
   if (isDefaultValue(v)) return { text: "DEFAULT", cls: "default", truncated: false, num: false };
   if (isBinary(v)) {
     return { text: `<blob ${formatSize(v.size)}>`, cls: "dim", truncated: false, num: false };
@@ -53,7 +68,7 @@ export function renderCell(v: CellValue | undefined, col: ResultColumn): Rendere
   if (typeof v === "number") return { text: String(v), cls: "", truncated: false, num: true };
   const kind = col.kind;
   if (kind === "datetime" || kind === "date" || kind === "time") {
-    return { text: formatDateTime(v), cls: "", truncated: false, num: false };
+    return { text: formatDateTime(v, kind), cls: "", truncated: false, num: false };
   }
   if (kind === "json") return { text: oneLine(v), cls: "json", truncated: false, num: false };
   const num = isNumericKind(kind);

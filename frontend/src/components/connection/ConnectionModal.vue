@@ -174,6 +174,27 @@ const colorHex: Record<string, string> = {
   none: "transparent", green: "var(--conn-green)", yellow: "var(--conn-yellow)", orange: "var(--conn-orange)",
   red: "var(--conn-red)", blue: "var(--conn-blue)", purple: "var(--conn-purple)",
 };
+const colorName: Record<string, string> = {
+  none: "No color", green: "Green", yellow: "Yellow", orange: "Orange", red: "Red", blue: "Blue", purple: "Purple",
+};
+
+// ---- environment presets: set color + read-only together (the saved model stays color + readOnly) ----
+type EnvId = "none" | "local" | "staging" | "production";
+const ENV_PRESETS: { id: EnvId; label: string; color: ConnectionConfig["color"]; readOnly: boolean; hint: string }[] = [
+  { id: "none", label: "None", color: "none", readOnly: false, hint: "No color, writes allowed" },
+  { id: "local", label: "Local", color: "green", readOnly: false, hint: "Green, writes allowed" },
+  { id: "staging", label: "Staging", color: "orange", readOnly: false, hint: "Orange, writes allowed" },
+  { id: "production", label: "Production", color: "red", readOnly: true, hint: "Red, read-only" },
+];
+/** The preset matching the current color + read-only, or "custom" when they were set by hand. */
+const env = computed<EnvId | "custom">(
+  () => ENV_PRESETS.find((p) => p.color === form.value.color && p.readOnly === !!form.value.readOnly)?.id ?? "custom",
+);
+function applyPreset(id: EnvId) {
+  const p = ENV_PRESETS.find((x) => x.id === id)!;
+  form.value.color = p.color;
+  form.value.readOnly = p.readOnly;
+}
 const suggestReadOnly = computed(() => form.value.color === "red" && !form.value.readOnly);
 
 function setDriver(d: ConnectionConfig["driver"]) {
@@ -600,30 +621,64 @@ function onKey(e: KeyboardEvent) {
         </div>
       </div>
 
-      <!-- 5. appearance & safety -->
-      <div class="card safety">
-        <div class="swatches" role="radiogroup" aria-label="Color">
-          <span class="lbl">Color</span>
-          <button
-            v-for="c in CONN_COLORS"
-            :key="c"
-            type="button"
-            class="sw"
-            :class="{ on: form.color === c, none: c === 'none' }"
-            :title="c"
-            :aria-label="c"
-            :style="{ '--c': c === 'none' ? 'var(--dim)' : colorHex[c], background: c === 'none' ? 'transparent' : colorHex[c] }"
-            @click="form.color = c"
-          />
+      <!-- 5. environment: color + read-only -->
+      <div class="card env">
+        <div class="f">
+          <label id="env-lbl">Environment</label>
+          <div class="seg" role="radiogroup" aria-labelledby="env-lbl">
+            <button
+              v-for="p in ENV_PRESETS"
+              :key="p.id"
+              type="button"
+              role="radio"
+              :aria-checked="env === p.id"
+              :class="{ on: env === p.id }"
+              :title="p.hint"
+              @click="applyPreset(p.id)"
+            >
+              <span class="edot" :class="{ none: p.color === 'none' }" :style="{ background: p.color === 'none' ? 'transparent' : colorHex[p.color] }" />{{ p.label }}
+            </button>
+            <span v-if="env === 'custom'" class="custom" title="Color and read-only were set by hand">Custom</span>
+          </div>
         </div>
-        <div class="roRow">
-          <span class="lbl">Read-only</span>
-          <span class="tg" :class="{ on: form.readOnly }" role="switch" :aria-checked="form.readOnly" aria-label="Read-only" tabindex="0" title="Blocks all writes at the session level" @click="form.readOnly = !form.readOnly" @keydown.space.prevent="form.readOnly = !form.readOnly" />
+        <div class="safety">
+          <div class="swatches" role="radiogroup" aria-label="Color">
+            <span class="lbl">Color</span>
+            <button
+              v-for="c in CONN_COLORS"
+              :key="c"
+              type="button"
+              class="sw"
+              role="radio"
+              :aria-checked="form.color === c"
+              :class="{ on: form.color === c, none: c === 'none' }"
+              :title="colorName[c]"
+              :aria-label="colorName[c]"
+              :style="{ '--c': c === 'none' ? 'var(--dim)' : colorHex[c], background: c === 'none' ? 'transparent' : colorHex[c] }"
+              @click="form.color = c"
+            />
+          </div>
+          <div class="roRow">
+            <span class="lbl">Read-only</span>
+            <span class="tg" :class="{ on: form.readOnly }" role="switch" :aria-checked="form.readOnly" aria-label="Read-only" tabindex="0" title="Blocks all writes at the session level" @click="form.readOnly = !form.readOnly" @keydown.space.prevent="form.readOnly = !form.readOnly" />
+          </div>
         </div>
-      </div>
-      <div v-if="suggestReadOnly" class="warnrow">
-        Red usually means production.
-        <button type="button" class="mini" @click="form.readOnly = true">Enable read-only</button>
+        <div v-if="env === 'production'" class="envnote prod">
+          <Icon name="lock" :size="12" />
+          <span>
+            <b>Read-only is on</b>: edits, deletes and schema changes are blocked for this connection.
+            If you turn it off, saving changes on a red connection asks for an extra confirmation with the SQL shown.
+          </span>
+        </div>
+        <div v-else-if="suggestReadOnly" class="envnote warn">
+          <Icon name="warn" :size="12" />
+          <span>Red means production. Writes are allowed, but each save asks for an extra confirmation.</span>
+          <button type="button" class="mini" @click="form.readOnly = true">Enable read-only</button>
+        </div>
+        <div v-else-if="form.readOnly" class="envnote">
+          <Icon name="lock" :size="12" />
+          <span>Read-only: edits, deletes and schema changes are blocked for this connection.</span>
+        </div>
       </div>
 
       <!-- 6. advanced (collapsed) -->
@@ -732,8 +787,12 @@ select.input { padding-right: 6px; appearance: auto; }
 .check { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--tx); }
 .check input { accent-color: var(--ac); width: 14px; height: 14px; margin: 0; }
 
-/* appearance & safety: one compact row */
-.safety { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 14px; height: 48px; }
+/* environment card: preset segments, then color + read-only, then an explanation */
+.env { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; }
+.edot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.edot.none { box-shadow: inset 0 0 0 1px var(--dim); }
+.seg .custom { display: inline-flex; align-items: center; padding: 0 10px; font-size: 11.5px; color: var(--tx); font-weight: 500; border-radius: calc(var(--r) - 3px); background: var(--bg3); box-shadow: 0 0 0 1px var(--bd2); white-space: nowrap; }
+.safety { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 24px; }
 .swatches { display: flex; align-items: center; gap: 10px; }
 .swatches .lbl { margin-right: 4px; }
 .sw { width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid transparent; padding: 0; position: relative; flex: none; }
@@ -742,7 +801,14 @@ select.input { padding-right: 6px; appearance: auto; }
 .sw.on { box-shadow: 0 0 0 2px var(--bg2), 0 0 0 4px var(--c, var(--tx)); }
 .sw:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg2), 0 0 0 4px var(--ring); }
 .roRow { display: flex; align-items: center; gap: 10px; }
-.warnrow { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--warn); margin-top: -6px; }
+.envnote { display: flex; align-items: flex-start; gap: 7px; font-size: 11.5px; line-height: 1.45; color: var(--dim); padding: 7px 10px; border-radius: var(--r); background: var(--bg); border: 1px solid var(--bd); }
+.envnote > :deep(svg) { flex: none; margin-top: 2px; }
+.envnote > span { flex: 1; min-width: 0; }
+.envnote b { font-weight: 600; }
+.envnote.prod { color: var(--tx); border-color: color-mix(in srgb, var(--conn-red) 45%, transparent); background: color-mix(in srgb, var(--conn-red) 9%, transparent); }
+.envnote.prod > :deep(svg) { color: var(--conn-red); }
+.envnote.warn { align-items: center; color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.envnote.warn > :deep(svg) { margin-top: 0; }
 
 /* advanced disclosure */
 .adv { margin-top: -4px; }

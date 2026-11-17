@@ -34,12 +34,26 @@ export type Theme = "dark" | "light" | "system";
 
 export type ToastKind = "info" | "success" | "warning" | "error";
 
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
 export interface Toast {
   id: number;
   message: string;
   kind: ToastKind;
   /** ms; 0 = sticky until dismissed */
   timeout: number;
+  /** technical detail (raw driver error), shown collapsed under "Details" */
+  detail?: string;
+  /** buttons; clicking one runs it and dismisses the toast */
+  actions?: ToastAction[];
+}
+
+export interface ToastOptions {
+  detail?: string;
+  actions?: ToastAction[];
 }
 
 /** Modals the ui store can open (single modal at a time). */
@@ -49,6 +63,8 @@ export type ModalName =
   | "saveChanges" // SQL preview + confirm before ApplyChanges
   | "export"
   | "findInDatabase"
+  | "settings" // SettingsModal
+  | "shortcuts" // ShortcutsModal (keyboard reference)
   | "confirm"; // generic confirm (ui.confirm())
 
 export interface ModalState {

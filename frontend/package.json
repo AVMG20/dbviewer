@@ -26,6 +26,7 @@
     "codemirror": "^6.0.2",
     "fzf": "^0.5.2",
     "pinia": "^4.1.0",
+    "sql-formatter": "^15.9.0",
     "vue": "^3.2.45"
   },
   "devDependencies": {

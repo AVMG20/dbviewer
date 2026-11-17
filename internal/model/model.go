@@ -442,6 +442,19 @@ type StatementRange struct {
 	Start int    `json:"start"` // UTF-16 offset (JS string index), inclusive
 	End   int    `json:"end"`   // exclusive, excludes the trailing ';'
 	SQL   string `json:"sql"`
+	// Classification (sqltok.Inspect), for the console's safety checks and tab names.
+	// Kind: main keyword, lowercase ("select", "update", …; WITH: the statement after the CTEs).
+	Kind string `json:"kind"`
+	// Writes: changes data or the schema (DML, DDL, GRANT, CALL, …); not SET / USE / BEGIN / COMMIT.
+	Writes bool `json:"writes"`
+	// Table: first table the statement references, unquoted ("" = none).
+	Table string `json:"table"`
+	// NoWhere: UPDATE / DELETE without WHERE (or LIMIT / JOIN): affects every row.
+	NoWhere bool `json:"noWhere"`
+	// TargetSchema / TargetTable: the one plain table of a NoWhere statement (unquoted, as
+	// stored; schema "" = default), so its row count can be shown. Empty when not that simple.
+	TargetSchema string `json:"targetSchema"`
+	TargetTable  string `json:"targetTable"`
 }
 
 // CellRequest loads the full value of a truncated cell.
@@ -537,6 +550,9 @@ type ExportRequest struct {
 	IncludeHeader bool     `json:"includeHeader"` // csv/tsv
 	SQLTable      string   `json:"sqlTable"`      // table name used in INSERT statements (sql format)
 	Columns       []string `json:"columns"`       // subset/order of columns, empty = all
+	// Schema: default schema for unqualified names of a SQL source ("" = the connection's
+	// default), like QueryRequest.Schema. Ignored for page sources.
+	Schema string `json:"schema"`
 }
 
 type ExportResult struct {

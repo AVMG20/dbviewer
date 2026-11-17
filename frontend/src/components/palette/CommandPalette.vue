@@ -4,6 +4,7 @@
 // Uses SchemaService.SearchObjects when implemented, otherwise searches the cached
 // SchemaIndex of the connected connections locally.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { kbd } from "@/lib/kbd";
 import { apiError, projectApi, schemaApi, type SavedQuery, type SearchHit } from "@/api";
 import { useProjectsStore } from "@/stores/projects";
 import { useTabsStore } from "@/stores/tabs";
@@ -11,6 +12,7 @@ import { useUiStore } from "@/stores/ui";
 import Icon from "@/components/common/Icon.vue";
 import { fuzzy, highlightSegments, matchTable, normQuery } from "@/components/common/fuzzy";
 import { cache, isViewKind, loadIndex } from "@/components/sidebar/schemaCache";
+import { recent } from "@/lib/recent";
 
 const projects = useProjectsStore();
 const tabs = useTabsStore();
@@ -33,6 +35,8 @@ interface Item {
   keepOpen?: boolean;
   /** do not move focus to the active view afterwards */
   noFocus?: boolean;
+  /** section header shown above the first item of a group (empty query only) */
+  group?: string;
 }
 
 const accent = computed(() => {
@@ -56,7 +60,7 @@ const activeConnId = () => tabs.active?.connId ?? projects.projectConnections[0]
 interface Cmd { id: string; label: string; hint?: string; noFocus?: boolean; run: () => void }
 const commands = computed<Cmd[]>(() => [
   {
-    id: "console", label: "New SQL console", hint: "⌘T",
+    id: "console", label: "New SQL console", hint: kbd("⌘T"),
     run: () => {
       const id = activeConnId();
       if (id) tabs.openConsole(id);
@@ -76,15 +80,20 @@ const commands = computed<Cmd[]>(() => [
   { id: "sidebar", label: "Toggle sidebar", run: () => ui.toggleSidebar() },
   { id: "focus", label: "Focus sidebar (speed search)", noFocus: true, run: () => ui.focusSidebar() },
   {
-    id: "find", label: "Find in database…", hint: "⇧⌘F", noFocus: true,
+    id: "find", label: "Find in database…", hint: kbd("⇧⌘F"), noFocus: true,
     run: () => ui.openModal("findInDatabase", { connId: tabs.active?.connId ?? "" }),
   },
   {
-    id: "closetab", label: "Close tab", hint: "⌘W",
+    id: "closetab", label: "Close tab", hint: kbd("⌘W"),
     run: () => {
       if (tabs.activeId) void tabs.close(tabs.activeId);
     },
   },
+  { id: "settings", label: "Settings…", hint: kbd("⌘,"), noFocus: true, run: () => ui.openModal("settings") },
+  { id: "shortcuts", label: "Keyboard shortcuts", hint: kbd("⌘/"), noFocus: true, run: () => ui.openModal("shortcuts") },
+  ...projects.projects
+    .filter((p) => p.id !== projects.activeProjectId)
+    .map((p) => ({ id: `project:${p.id}`, label: `Switch to project: ${p.name}`, noFocus: true, run: () => void projects.setActiveProject(p.id) })),
 ]);
 
 // ---- items ---------------------------------------------------------------------
@@ -92,9 +101,12 @@ function connRight(connId: string) {
   return projects.getConnection(connId)?.name ?? "";
 }
 
-function openTableItem(connId: string, schema: string, table: string, alt: boolean) {
+/** Opens a table (or its structure) and shows it in the sidebar; a column hit also selects that column in the tree and the grid. */
+function openTableItem(connId: string, schema: string, table: string, alt: boolean, column?: string) {
   if (alt) tabs.openStructure(connId, schema, table, { focus: true });
   else tabs.openTable(connId, schema, table, { preview: true, focus: true });
+  ui.revealInSidebar(connId, schema, table, column || undefined);
+  if (column && !alt) ui.focusColumn(connId, schema, table, column);
 }
 
 function localTableItems(nq: string): Item[] {
@@ -109,7 +121,7 @@ function localTableItems(nq: string): Item[] {
         out.push({
           key: `${c.id}:${schema}:${t.name}`, kind: m.hint ? "column" : isViewKind(t.kind) ? "view" : "table", connId: c.id,
           score: m.score, segs: m.segs, hint: m.hint,
-          run: (alt) => openTableItem(c.id, schema, t.name, alt),
+          run: (alt) => openTableItem(c.id, schema, t.name, alt, m.column),
         });
       }
     }
@@ -130,7 +142,7 @@ function remoteItems(hits: SearchHit[]): Item[] {
         if (h.kind === "saved_query") {
           const sq = saved.value.find((s) => s.id === h.savedId);
           tabs.openConsole(h.connId || activeConnId() || "", sq?.sql ?? "");
-        } else openTableItem(h.connId, h.schema, h.table, alt);
+        } else openTableItem(h.connId, h.schema, h.table, alt, h.kind === "column" ? h.column : undefined);
       },
     };
   });
@@ -144,12 +156,25 @@ const items = computed<Item[]>(() => {
   const commandsOnly = q.value.startsWith(">");
   const out: Item[] = [];
 
+  if (!nq && !commandsOnly) {
+    recent.value
+      .filter((r) => projects.getConnection(r.connId) && !(tabs.active?.connId === r.connId && tabs.active.table === r.table && (tabs.active.schema ?? "") === r.schema))
+      .slice(0, 6)
+      .forEach((r, i) => {
+        out.push({
+          key: `recent:${r.kind}:${r.connId}:${r.schema}:${r.table}`, kind: "table", connId: r.connId, score: 200000 - i, group: "Recent",
+          segs: [{ t: r.table, m: false }], hint: r.kind === "structure" ? [{ t: "structure", m: false }] : undefined,
+          run: (alt) => openTableItem(r.connId, r.schema, r.table, alt || r.kind === "structure"),
+        });
+      });
+  }
+
   for (const c of commands.value) {
     const h = nq ? fuzzy(nq, c.label) : { score: 0, positions: [] as number[] };
     if (!h) continue;
     out.push({
       key: `cmd:${c.id}`, kind: "command", score: nq ? h.score + 5000 : 100000, segs: highlightSegments(c.label, h.positions),
-      right: c.hint, run: c.run, noFocus: c.noFocus,
+      right: c.hint, run: c.run, noFocus: c.noFocus, group: "Commands",
     });
   }
   if (commandsOnly) return out.sort((a, b) => b.score - a.score).slice(0, 60);
@@ -159,7 +184,7 @@ const items = computed<Item[]>(() => {
     if (!h) continue;
     out.push({
       key: `conn:${c.id}`, kind: "conn", connId: c.id, score: nq ? h.score + 9000 : 50000, segs: highlightSegments(c.name, h.positions),
-      noFocus: true,
+      noFocus: true, group: "Connections",
       run: () => {
         ui.revealInSidebar(c.id);
         ui.focusSidebar();
@@ -295,7 +320,7 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
-const kindIcon = { command: "cmd", conn: "db", table: "table", view: "view", column: "table", saved: "query" } as const;
+const kindIcon = { command: "chev", conn: "db", table: "table", view: "view", column: "columns", saved: "query" } as const;
 const kindLabel = { command: "", conn: "connection", table: "", view: "view", column: "", saved: "saved query" } as const;
 </script>
 
@@ -314,9 +339,9 @@ const kindLabel = { command: "", conn: "connection", table: "", view: "view", co
           @keydown="onKey"
         />
         <div ref="listEl" class="max-h-[340px] overflow-auto py-1">
+          <template v-for="(it, i) in items" :key="it.key">
+          <div v-if="!q.trim() && it.group && it.group !== items[i - 1]?.group" class="grp">{{ it.group }}</div>
           <div
-            v-for="(it, i) in items"
-            :key="it.key"
             class="it flex h-[26px] items-center gap-2 px-3.5"
             :class="{ act: i === idx }"
             :style="{ '--conn': it.connId ? projects.connColor(it.connId) : undefined }"
@@ -338,6 +363,7 @@ const kindLabel = { command: "", conn: "connection", table: "", view: "view", co
               <kbd v-else-if="it.right">{{ it.right }}</kbd>
             </span>
           </div>
+          </template>
           <div v-if="!items.length" class="dim px-3.5 py-3">No results.</div>
           <div v-else-if="q.trim() && unconnected.length && !q.startsWith('>')" class="dim border-t border-bd px-3.5 py-1.5 text-[11px]">
             {{ unconnected.length }} connection{{ unconnected.length === 1 ? "" : "s" }} not connected: their tables are not searched until you connect.
@@ -346,7 +372,7 @@ const kindLabel = { command: "", conn: "connection", table: "", view: "view", co
         <div class="flex items-center gap-3 border-t border-bd px-3.5 py-1 text-[11px] text-dim">
           <span><kbd>↑↓</kbd> navigate</span>
           <span><kbd>↵</kbd> open</span>
-          <span><kbd>⌘↵</kbd> structure</span>
+          <span><kbd>{{ kbd("⌘↵") }}</kbd> structure</span>
           <span><kbd>esc</kbd> close</span>
         </div>
       </div>
@@ -357,5 +383,6 @@ const kindLabel = { command: "", conn: "connection", table: "", view: "view", co
 <style scoped>
 .it { margin: 2px 6px; padding-left: 10px !important; padding-right: 10px !important; border-radius: var(--r); }
 .it.act { background: var(--selbg); }
+.grp { padding: 6px 16px 2px; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
 .m { color: var(--ac); font-weight: 700; }
 </style>

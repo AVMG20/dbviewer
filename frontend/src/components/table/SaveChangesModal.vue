@@ -2,6 +2,7 @@
 // SQL preview + confirm for staged changes (data + structure), built on the shared <Modal>.
 // The parent runs the apply and feeds back `error` / `failedIndex`; staged changes stay on failure.
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { kbd } from "@/lib/kbd";
 import Modal from "@/components/common/Modal.vue";
 import { highlightSql } from "@/lib/sqlHighlight";
 import { copyText } from "@/lib/clipboard";
@@ -61,7 +62,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
       <span class="flex-1"></span>
       <button class="btn" :disabled="applying" @click="emit('cancel')">Cancel</button>
       <button class="btn" :class="danger ? 'danger' : 'primary'" :disabled="applying || loading || !statements.length" @click="emit('confirm')">
-        {{ applying ? "Saving…" : (confirmText ?? "Save") }} <kbd class="kk">⌘↵</kbd>
+        {{ applying ? "Saving…" : (confirmText ?? "Save") }} <kbd class="kk">{{ kbd("⌘↵") }}</kbd>
       </button>
     </template>
   </Modal>

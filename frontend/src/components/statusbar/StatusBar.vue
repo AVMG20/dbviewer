@@ -8,6 +8,7 @@ import { useTabsStore } from "@/stores/tabs";
 import { useUiStore } from "@/stores/ui";
 import type { Driver } from "@/api";
 import { DRIVER_LABEL } from "@/types";
+import { copyText } from "@/lib/clipboard";
 
 const projects = useProjectsStore();
 const tabs = useTabsStore();
@@ -29,6 +30,30 @@ const pending = computed(() => {
 const fmt = (n: number) => n.toLocaleString("en-US");
 const dur = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : Math.round(ms) + " ms");
 const tint = computed(() => projects.connColor(conn.value?.id ?? ""));
+/** Without a tab: the open connections of the project (instead of a bare "No connection"). */
+const openConns = computed(() => projects.projectConnections.filter((c) => projects.statuses[c.id]?.connected));
+
+// Selection aggregates of the active tab's grid.
+const stats = computed(() => (ui.selectionStats && ui.selectionStats.tabId === tab.value?.id ? ui.selectionStats : null));
+function num(n: number): string {
+  const a = Math.abs(n);
+  const digits = a !== 0 && a < 1 ? 6 : a < 1000 ? 4 : 2;
+  return n.toLocaleString(undefined, { maximumFractionDigits: digits });
+}
+const statParts = computed(() => {
+  const s = stats.value;
+  if (!s) return [];
+  const out: { k: string; v: string; copy: string }[] = [{ k: "Count", v: fmt(s.values), copy: String(s.values) }];
+  if (s.numbers && s.sum !== undefined) {
+    out.push({ k: "Sum", v: num(s.sum), copy: String(s.sum) });
+    if (s.numbers > 1) out.push({ k: "Avg", v: num(s.avg!), copy: String(s.avg) }, { k: "Min", v: num(s.min!), copy: String(s.min) }, { k: "Max", v: num(s.max!), copy: String(s.max) });
+  }
+  return out;
+});
+async function copyStat(v: string) {
+  await copyText(v);
+  ui.toast(`Copied ${v}`, "success", 1200);
+}
 const hasTint = computed(() => !!conn.value && conn.value.color !== "none");
 </script>
 
@@ -52,7 +77,14 @@ const hasTint = computed(() => !!conn.value && conn.value.color !== "none");
       <span v-if="conn.readOnly" class="pill" :class="{ neutral: conn.color !== 'red' }" style="padding-block: 0">{{ conn.color === "red" ? "PRODUCTION · READ-ONLY" : "READ-ONLY" }}</span>
       <span v-else-if="conn.color === 'red'" class="pill" style="padding-block: 0">PRODUCTION</span>
     </template>
-    <span v-else>No connection</span>
+    <template v-else-if="openConns.length">
+      <span v-for="c in openConns.slice(0, 4)" :key="c.id" class="flex items-center gap-1.5 text-tx" :style="{ '--conn': projects.connColor(c.id) }">
+        <span class="conn-dot" />{{ c.name }}
+      </span>
+      <span v-if="openConns.length > 4">+{{ openConns.length - 4 }} more</span>
+    </template>
+    <span v-else-if="projects.projectConnections.length">Not connected · click a connection in the sidebar</span>
+    <span v-else>No connections yet</span>
 
     <span v-if="info?.durationMs !== undefined">Query: {{ dur(info.durationMs) }}</span>
     <span v-if="info?.rows !== undefined">
@@ -61,6 +93,16 @@ const hasTint = computed(() => !!conn.value && conn.value.color !== "none");
     <span v-if="info?.message">{{ info.message }}</span>
 
     <span class="flex-1" />
+    <span v-if="statParts.length" class="flex items-center gap-2.5" aria-label="Selection summary">
+      <button v-for="p in statParts" :key="p.k" class="stat" :title="`Copy ${p.k.toLowerCase()}`" @click="copyStat(p.copy)">
+        {{ p.k }} <span class="mono text-tx">{{ p.v }}</span>
+      </button>
+    </span>
     <span v-if="pending" class="text-warn">{{ pending }} pending change{{ pending === 1 ? "" : "s" }}</span>
   </footer>
 </template>
+
+<style scoped>
+.stat { border: 0; background: none; padding: 0 2px; color: var(--dim); font-size: 11px; border-radius: 3px; }
+.stat:hover { background: var(--hov); }
+</style>

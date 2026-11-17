@@ -12,7 +12,9 @@ export PATH="/opt/workbench/profile/bin:$HOME/go/bin:$PATH"
 export WAILS_VITE_PORT="${WAILS_VITE_PORT:-9245}"
 export WAILS_SERVER_PORT="${WAILS_SERVER_PORT:-9246}"
 export DBVIEWER_DATA_DIR="${DBVIEWER_DATA_DIR:-$PWD/testdata/appdata}"
-export CGO_CFLAGS="-mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0" MACOSX_DEPLOYMENT_TARGET=12.0
+if [ "$(uname)" = Darwin ]; then
+  export CGO_CFLAGS="-mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0" MACOSX_DEPLOYMENT_TARGET=12.0
+fi
 
 wails3 generate bindings -clean=true -ts -i >/dev/null
 mkdir -p frontend/dist bin

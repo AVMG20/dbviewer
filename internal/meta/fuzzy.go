@@ -97,6 +97,25 @@ func Search(q string, inputs []SearchInput, saved []model.SavedQuery, limit int)
 				hits = append(hits, model.SearchHit{ConnID: in.ConnID, Schema: in.Index.Schema, Table: t.Name, Kind: t.Kind,
 					Label: t.Name, Score: s + 5, Positions: pos})
 			}
+			// "table column" / "table.column": the part before the last space or dot
+			// narrows the table, the rest matches a column of it.
+			if tq, cq, split := splitTableColumn(q); split {
+				if tScore, tPos, ok := Score(tq, t.Name); ok {
+					for _, c := range t.Columns {
+						if cs, cpos, ok := Score(cq, c); ok {
+							label := t.Name + " · " + c
+							off := len(t.Name) + len(" · ")
+							pos := append([]int{}, tPos...)
+							for _, p := range cpos {
+								pos = append(pos, p+off)
+							}
+							hits = append(hits, model.SearchHit{ConnID: in.ConnID, Schema: in.Index.Schema, Table: t.Name, Column: c,
+								Kind: "column", Label: label, Score: tScore + cs, Positions: pos})
+						}
+					}
+					continue
+				}
+			}
 			for _, c := range t.Columns {
 				if s, pos, ok := Score(q, c); ok {
 					label := t.Name + " · " + c
@@ -128,6 +147,21 @@ func Search(q string, inputs []SearchInput, saved []model.SavedQuery, limit int)
 		hits[i].Positions = toUTF16(hits[i].Label, hits[i].Positions)
 	}
 	return hits
+}
+
+// splitTableColumn splits "sales_order grand" / "sales_order.grand_total" at the last
+// space or dot into a table part and a column part (both non-empty).
+func splitTableColumn(q string) (string, string, bool) {
+	q = strings.TrimSpace(q)
+	i := strings.LastIndexAny(q, " .")
+	if i <= 0 || i >= len(q)-1 {
+		return "", "", false
+	}
+	t, c := strings.TrimSpace(q[:i]), strings.TrimSpace(q[i+1:])
+	if t == "" || c == "" {
+		return "", "", false
+	}
+	return t, c, true
 }
 
 // toUTF16 converts byte offsets into UTF-16 code unit offsets (JS string indexes).

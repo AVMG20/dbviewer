@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // Multi-line / JSON cell editor (and viewer) popover, anchored near a cell.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { kbd } from "@/lib/kbd";
 import { minifyJson, prettyJson } from "@/lib/format";
 import { currentAccent } from "@/lib/accent";
 import { isMod } from "@/lib/keys";
@@ -178,7 +179,7 @@ function minify() {
         </template>
         <span class="flex-1"></span>
         <button class="btn ghost" @click="emit('cancel')">{{ canEdit ? "Cancel" : "Close" }} <kbd>esc</kbd></button>
-        <button v-if="canEdit" class="btn primary" :disabled="loading" @click="commit">Apply <kbd class="kk">⌘↵</kbd></button>
+        <button v-if="canEdit" class="btn primary" :disabled="loading" @click="commit">Apply <kbd class="kk">{{ kbd("⌘↵") }}</kbd></button>
       </div>
       <div v-if="canEdit" class="pop-hint">Click outside to cancel</div>
     </div>

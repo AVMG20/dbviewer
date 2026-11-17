@@ -16,13 +16,15 @@
 - **Projects** with multiple connections, each with an optional color that tints its tabs
 - **Read-only connections**, enforced in the UI, the backend and the database session
 - **Staged editing**: inline edits, row inserts and deletes are only written on Save, in one transaction
-- **Sidebar filter**: focus the table list and type to filter the tables of the open databases; it stays on while you work, Esc clears it
+- **Sidebar filter**: type to filter tables and columns of the open databases; tables expand to show their columns, Esc clears it
+- **Jump anywhere** with Cmd/Ctrl+K: tables, columns (`orders total`), connections, saved queries and recent tables
 - **Filtering** with raw SQL `WHERE` / `ORDER BY` (highlighting and completion), quick find, per-column filters
-- **SQL console** with schema-aware autocomplete, history, saved queries and EXPLAIN
+- **SQL console** with schema-aware autocomplete, formatting, export, history, saved queries and EXPLAIN; asks before UPDATE/DELETE without WHERE and before writes on red (production) connections
+- **Selection totals**: count, sum, average, min and max of the selected cells in the status bar
 - **Foreign keys**: Cmd/Ctrl-click a value to open the referenced row; mouse back/forward to return
 - **Copy as** TSV, CSV, JSON, SQL INSERT or Markdown; paste TSV/CSV from a spreadsheet
 - **Connections** over TCP, Unix socket or SSH tunnel (agent, `~/.ssh/config`, default keys); paste a connection URL or Laravel `.env` to fill the form
-- Dark and light theme
+- **Settings** (Cmd/Ctrl+,): theme, zoom, row height, page size, NULL and date display; all shortcuts under Cmd/Ctrl+/
 
 ## Install
 

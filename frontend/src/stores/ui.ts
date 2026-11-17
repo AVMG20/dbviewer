@@ -3,8 +3,9 @@
 //
 // ============================== PUBLIC API (stable) ==============================
 //   theme: "dark" | "light" | "system"; effectiveTheme; setTheme(t); cycleTheme()
-//   toast(message, kind = "info", timeout?) -> id   kinds: info|success|warning|error
-//        (default timeout 3s, errors 6s, 0 = sticky). dismissToast(id)
+//   toast(message, kind = "info", timeout?, opts?) -> id   kinds: info|success|warning|error
+//        (default timeout 3s, errors 6s, errors with actions 12s, 0 = sticky). dismissToast(id)
+//        opts: { detail?: raw error shown under "Details", actions?: [{label, run}] }. pinToast(id) stops the timer
 //   paletteOpen, openPalette(), closePalette(), togglePalette()
 //   modal: { name, props } | null; openModal(name, props), closeModal()
 //        MODAL STACK: openModal() replaces the stack with a new base dialog; confirm() and
@@ -30,14 +31,22 @@
 //        after each load / query, e.g. ui.setStatus({ tabId: tab.id, durationMs: r.durationMs, rows: r.rows.length, total: r.total }).
 //        Fields not given keep their previous value; clearStatus(tabId) resets.
 //   sidebarWidth, sidebarVisible, toggleSidebar(); loadPrefs() (called by App)
-//   revealRequest / revealInSidebar(connId, schema?, table?): expands the tree to the object
+//   revealRequest / revealInSidebar(connId, schema?, table?, column?): expands the tree to the object
+//        (with a column: expands the table and selects the column row)
+//   focusColumnRequest / focusColumn(connId, schema, table, column): the matching table view
+//        scrolls to and selects that column (palette column hits)
+//   settings (lib/settings.ts): zoom, density, pageSize, nullStyle, dateStyle; persisted in ui:prefs.
+//        zoomIn() / zoomOut() / zoomReset()
+//   selectionStats: aggregates of the active grid selection, shown in the status bar
 //   focusSidebar(): moves keyboard focus to the sidebar tree
 //   refreshConnection(connId): reloads the sidebar tree + search index of a connection
 // =================================================================================
 import { defineStore } from "pinia";
 import { computed, markRaw, ref, shallowRef, watch, type Component } from "vue";
 import { projectApi } from "@/api";
-import type { ConfirmOptions, ModalName, ModalState, Theme, Toast, ToastKind } from "@/types";
+import { Window } from "@wailsio/runtime";
+import { applySettings, settings, ZOOM_MAX, ZOOM_MIN } from "@/lib/settings";
+import type { ConfirmOptions, ModalName, ModalState, Theme, Toast, ToastKind, ToastOptions } from "@/types";
 
 let toastSeq = 0;
 const PREFS_KEY = "ui:prefs";
@@ -55,6 +64,29 @@ export interface RevealRequest {
   connId: string;
   schema?: string;
   table?: string;
+  column?: string;
+}
+
+export interface FocusColumnRequest {
+  seq: number;
+  connId: string;
+  schema: string;
+  table: string;
+  column: string;
+}
+
+/** Aggregates of the selected cells (status bar). Numeric fields only when numbers were selected. */
+export interface SelectionStats {
+  /** tab the grid belongs to */
+  tabId: string;
+  cells: number;
+  /** non-NULL cells */
+  values: number;
+  numbers: number;
+  sum?: number;
+  avg?: number;
+  min?: number;
+  max?: number;
 }
 
 export const useUiStore = defineStore("ui", () => {
@@ -87,19 +119,24 @@ export const useUiStore = defineStore("ui", () => {
   /** Repeat counts of collapsed identical toasts ("... ×5"), by toast id. */
   const toastCounts = ref<Record<number, number>>({});
   const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
-  function toast(message: string, kind: ToastKind = "info", timeout?: number): number {
-    const t = timeout ?? (kind === "error" ? 6000 : 3000);
+  function toast(message: string, kind: ToastKind = "info", timeout?: number, opts?: ToastOptions): number {
+    const t = timeout ?? (kind === "error" ? (opts?.actions?.length ? 12000 : 6000) : 3000);
     const same = toasts.value.find((x) => x.message === message && x.kind === kind);
     const id = same?.id ?? ++toastSeq;
     if (same) {
       toastCounts.value = { ...toastCounts.value, [id]: (toastCounts.value[id] ?? 1) + 1 };
       clearTimeout(toastTimers.get(id));
     } else {
-      toasts.value.push({ id, message, kind, timeout: t });
+      toasts.value.push({ id, message, kind, timeout: t, ...opts });
       if (toasts.value.length > 5) dismissToast(toasts.value[0].id);
     }
     if (t > 0) toastTimers.set(id, setTimeout(() => dismissToast(id), t));
     return id;
+  }
+  /** Keeps a toast until it is dismissed (stops its timer). */
+  function pinToast(id: number) {
+    clearTimeout(toastTimers.get(id));
+    toastTimers.delete(id);
   }
   function dismissToast(id: number) {
     toasts.value = toasts.value.filter((t) => t.id !== id);
@@ -264,10 +301,43 @@ export const useUiStore = defineStore("ui", () => {
 
   const revealRequest = ref<RevealRequest | null>(null);
   let revealSeq = 0;
-  function revealInSidebar(connId: string, schema?: string, table?: string) {
+  function revealInSidebar(connId: string, schema?: string, table?: string, column?: string) {
     sidebarVisible.value = true;
-    revealRequest.value = { seq: ++revealSeq, connId, schema, table };
+    revealRequest.value = { seq: ++revealSeq, connId, schema, table, column };
   }
+  const focusColumnRequest = ref<FocusColumnRequest | null>(null);
+  let focusColSeq = 0;
+  function focusColumn(connId: string, schema: string, table: string, column: string) {
+    focusColumnRequest.value = { seq: ++focusColSeq, connId, schema, table, column };
+  }
+
+  // ---- selection aggregates (status bar) -----------------------------------
+  const selectionStats = ref<SelectionStats | null>(null);
+  function setSelectionStats(s: SelectionStats | null) {
+    selectionStats.value = s;
+  }
+
+  // ---- zoom ------------------------------------------------------------------
+  /** Native webview zoom (keeps mouse coordinates exact); CSS zoom in browser dev mode. */
+  function applyZoom() {
+    const z = settings.zoom;
+    const css = (v: string) => ((document.documentElement.style as CSSStyleDeclaration & { zoom: string }).zoom = v);
+    // Native webview zoom keeps mouse coordinates exact; in browser dev (server mode) there
+    // is no window and SetZoom is a silent no-op, so fall back to CSS zoom there.
+    const w = window as unknown as { chrome?: { webview?: unknown }; webkit?: { messageHandlers?: { external?: unknown } } };
+    const native = !!(w.chrome?.webview || w.webkit?.messageHandlers?.external);
+    if (!native) return css(z === 1 ? "" : String(z));
+    Window.SetZoom(z)
+      .then(() => css(""))
+      .catch(() => css(z === 1 ? "" : String(z)));
+  }
+  function setZoom(z: number) {
+    settings.zoom = Math.round(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z)) * 10) / 10;
+  }
+  const zoomIn = () => setZoom(settings.zoom + 0.1);
+  const zoomOut = () => setZoom(settings.zoom - 0.1);
+  const zoomReset = () => setZoom(1);
+  watch(() => settings.zoom, applyZoom);
   const refreshRequest = ref<{ seq: number; connId: string } | null>(null);
   let refreshSeq = 0;
   function refreshConnection(connId: string) {
@@ -289,20 +359,22 @@ export const useUiStore = defineStore("ui", () => {
         if (p.theme === "dark" || p.theme === "light" || p.theme === "system") theme.value = p.theme;
         if (typeof p.sidebarWidth === "number") sidebarWidth.value = Math.min(560, Math.max(180, p.sidebarWidth));
         if (typeof p.sidebarVisible === "boolean") sidebarVisible.value = p.sidebarVisible;
+        applySettings(p.settings);
       }
     } catch {
       /* first run / backend not ready: keep defaults */
     }
     prefsLoaded = true;
     applyTheme();
+    applyZoom();
   }
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
-  watch([theme, sidebarWidth, sidebarVisible], () => {
+  watch([theme, sidebarWidth, sidebarVisible, () => ({ ...settings })], () => {
     if (!prefsLoaded) return;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       projectApi
-        .SetUIState(PREFS_KEY, JSON.stringify({ theme: theme.value, sidebarWidth: sidebarWidth.value, sidebarVisible: sidebarVisible.value }))
+        .SetUIState(PREFS_KEY, JSON.stringify({ theme: theme.value, sidebarWidth: sidebarWidth.value, sidebarVisible: sidebarVisible.value, settings: { ...settings } }))
         .catch(() => {});
     }, 400);
   });
@@ -311,7 +383,7 @@ export const useUiStore = defineStore("ui", () => {
 
   return {
     theme, effectiveTheme, setTheme, cycleTheme, applyTheme,
-    toasts, toastCounts, toast, dismissToast,
+    toasts, toastCounts, toast, dismissToast, pinToast,
     paletteOpen, openPalette, closePalette, togglePalette,
     modal, modalStack, openModal, closeModal, modalComponents, registerModal,
     overlayOpen, registerOverlay,
@@ -320,7 +392,8 @@ export const useUiStore = defineStore("ui", () => {
     focusActiveView, restoreFocus,
     statusByTab, setStatus, clearStatus, _setActiveTabGetter,
     sidebarWidth, sidebarVisible, toggleSidebar,
-    revealRequest, revealInSidebar, focusSidebarSeq, focusSidebar, refreshRequest, refreshConnection,
+    revealRequest, revealInSidebar, focusColumnRequest, focusColumn,
+    selectionStats, setSelectionStats, settings, zoomIn, zoomOut, zoomReset, focusSidebarSeq, focusSidebar, refreshRequest, refreshConnection,
     loadPrefs,
   };
 });

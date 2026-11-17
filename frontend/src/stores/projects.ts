@@ -17,6 +17,7 @@ import {
   type Project,
   type TestResult,
 } from "@/api";
+import { friendlyError } from "@/components/common/errors";
 import { useUiStore } from "./ui";
 
 const ACTIVE_PROJECT_KEY = "ui:activeProject";
@@ -234,7 +235,16 @@ export const useProjectsStore = defineStore("projects", () => {
       return true;
     } catch (e) {
       const err = apiError(e);
-      if (err.code !== "host_key_mismatch" && err.code !== "host_key_unknown") ui.toast(`${cfg.name}: ${err.message}`, "error");
+      if (err.code !== "host_key_mismatch" && err.code !== "host_key_unknown") {
+        const nice = friendlyError(err.message);
+        ui.toast(`${cfg.name}: ${nice ?? err.message}`, "error", undefined, {
+          detail: nice ? err.message : undefined,
+          actions: [
+            { label: "Retry", run: () => void ensureConnected(id) },
+            { label: "Edit connection", run: () => ui.openModal("connection", { connId: id }) },
+          ],
+        });
+      }
       return false;
     }
   }

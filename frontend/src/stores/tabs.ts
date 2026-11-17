@@ -33,6 +33,16 @@ import type { PersistedTabs, Tab } from "@/types";
 import { useProjectsStore } from "./projects";
 import { useUiStore } from "./ui";
 
+// Console tab names: a console is named after the first table its last run referenced
+// (tabs.autoTitle, called by SqlConsole) until the user renames it (tabs.rename: TabBar
+// double-click / "Rename…"); renamed tabs keep their name. Both persist with the tab state.
+declare module "@/types" {
+  interface Tab {
+    /** Title set by the user (console tabs): automatic naming leaves it alone. */
+    customTitle?: boolean;
+  }
+}
+
 export const useTabsStore = defineStore("tabs", () => {
   const tabs = ref<Tab[]>([]);
   const activeId = ref<string | null>(null);
@@ -269,6 +279,25 @@ export const useTabsStore = defineStore("tabs", () => {
     if (t) Object.assign(t, patch);
   }
 
+  /** Renames a tab (user action). An empty title gives a console back its automatic name. */
+  function rename(id: string, title: string) {
+    const t = tabs.value.find((x) => x.id === id);
+    if (!t) return;
+    const v = title.trim();
+    if (!v) {
+      t.customTitle = false;
+      return;
+    }
+    t.title = v;
+    t.customTitle = true;
+  }
+
+  /** Automatic console name (e.g. the queried table); ignored once the user renamed the tab. */
+  function autoTitle(id: string, title: string) {
+    const t = tabs.value.find((x) => x.id === id);
+    if (t && !t.customTitle && title && t.title !== title) t.title = title;
+  }
+
   /** Cycles tabs (Ctrl+Tab / Ctrl+Shift+Tab). */
   function cycle(dir: 1 | -1) {
     if (!tabs.value.length) return;
@@ -349,7 +378,7 @@ export const useTabsStore = defineStore("tabs", () => {
 
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   watch(
-    () => [tabs.value.map((t) => [t.id, t.kind, t.connId, t.schema, t.table, t.title, t.where, t.orderBy, t.sql, t.pinned, t.preview]), activeId.value],
+    () => [tabs.value.map((t) => [t.id, t.kind, t.connId, t.schema, t.table, t.title, t.customTitle, t.where, t.orderBy, t.sql, t.pinned, t.preview]), activeId.value],
     () => {
       const pid = currentProjectId.value;
       if (!pid) return;
@@ -365,6 +394,6 @@ export const useTabsStore = defineStore("tabs", () => {
     tabs, activeId, active,
     open, openTable, openStructure, openConsole, activate, close, closeOthers, closeConnection,
     consumeFocus, goBack, goForward, canGoBack, canGoForward,
-    promote, move, activateNth, setDirty, update, cycle, save, restore, switchProject, requestProjectSwitch, currentProjectId,
+    promote, move, activateNth, setDirty, update, rename, autoTitle, cycle, save, restore, switchProject, requestProjectSwitch, currentProjectId,
   };
 });

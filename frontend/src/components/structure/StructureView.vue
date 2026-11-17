@@ -3,6 +3,7 @@
 // Structure edits (drop / rename / add column, drop index) are staged and need Save with an SQL preview,
 // the same flow as data edits.
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { kbd } from "@/lib/kbd";
 import {
   apiError, schemaApi, newId,
   type ApplyResult, type Column, type Driver, type ForeignKey, type Index, type Table, type TableStructure, type Trigger,
@@ -261,12 +262,12 @@ const colCount = computed(() => columns.value.length);
       <span v-if="meta && meta.estRows >= 0" class="dim mono">~{{ fmtNum(meta.estRows) }} rows</span>
       <span class="flex-1"></span>
       <span v-if="readOnly" class="pill ro" title="Read-only connection: structure edits are disabled"><Icon name="lock" :size="10" /> READ-ONLY</span>
-      <button class="btn ghost" title="Refresh (⌘R)" @click="load"><Icon name="refresh" /></button>
+      <button class="btn ghost" :title="kbd('Refresh (⌘R)')" @click="load"><Icon name="refresh" /></button>
       <button class="btn ghost" @click="openTable(schema, table)"><Icon name="table" /> Open data</button>
       <span class="sep"></span>
       <button class="btn ghost" title="Add column" @click="addColumn"><Icon name="plus" /> Add column</button>
       <button class="btn ghost" :disabled="!anyStaged" @click="revertConfirm"><Icon name="undo" /> Revert</button>
-      <button class="btn primary" :disabled="!pending || readOnly || invalidDraft" :title="invalidDraft ? 'Give every new column a type' : 'Preview and save (⌘S)'" @click="save">
+      <button class="btn primary" :disabled="!pending || readOnly || invalidDraft" :title="kbd(invalidDraft ? 'Give every new column a type' : 'Preview and save (⌘S)')" @click="save">
         <Icon name="save" /> Save <span v-if="pending" class="bdg">{{ pending }}</span>
       </button>
     </div>
