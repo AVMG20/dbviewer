@@ -10,9 +10,9 @@ version: "0.1.0"
 section: "default"
 priority: "extra"
 maintainer: ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>
-description: "Database viewer"
-vendor: "dbviewer"
-homepage: "https://wails.io"
+description: "Database viewer for PostgreSQL, MySQL and SQLite"
+vendor: "DB Viewer"
+homepage: "https://github.com/AVMG20/dbviewer"
 license: "MIT"
 release: "1"
 
