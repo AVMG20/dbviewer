@@ -520,10 +520,19 @@ Saved passwords, SSH passwords and remembered key passphrases are stored **local
 written atomically (temp file + rename). The macOS Keychain is not used at all, so an
 ad-hoc signed build never shows Keychain prompts. `DBVIEWER_SECRETS` is gone (ignored).
 
-There is no migration: the Keychain is never read. A connection whose password was in
-the Keychain behaves as "no saved password": `Connect` (and lazy connects) reject with
-`password_required` ("the password of … is not saved; enter it"). The UI then asks for the
-password and calls `Connect(id, password)` — for `passwordMode: "save"` a non-empty
-password argument is used too. Saving the connection with a password stores it in the
-file again. UI labels: "Save password" (hint "Stored locally in the app's data folder")
-and "Remember passphrase".
+There is no migration: the Keychain is never read. `hasPassword`, `ssh.hasPassword` and
+`ssh.hasKeyPassphrase` always reflect whether the secret exists in `secrets.json`
+(computed in `Connections`/`GetConnection`, stale stored flags are fixed), so a password
+that was in the Keychain shows as "no saved password" and the form field is empty.
+
+Connecting a `passwordMode: "save"` connection without a saved password: if the server
+rejects the empty password, `Connect` (and lazy connects) reject with
+`password_required` ("the password of … is not saved; enter it (it will be saved for
+next time)"). The UI asks (PasswordModal: "It will be saved for next time.") and calls
+`Connect(id, password)`; **after a successful connect the password is saved** in
+`secrets.json` and `hasPassword` becomes true. A wrong password is never saved; "ask"
+connections never save. Likewise an SSH key passphrase entered via
+`ProvideKeyPassphrase` for a "save" connection is saved once its connect succeeds
+(key mode: the connection's passphrase; auto mode: per key file).
+UI labels: "Save password" (hint "Stored locally in the app's data folder") and
+"Remember passphrase".

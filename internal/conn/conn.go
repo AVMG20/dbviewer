@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,9 +90,9 @@ func (m *Manager) resolvePassword(cfg model.ConnectionConfig, explicit *string) 
 			return "", err
 		}
 		if !ok {
-			// saved before secrets moved out of the Keychain (never read, to avoid
-			// prompts): behave as "no saved password"
-			return "", model.Errf(model.ErrPasswordNeeded, "the password of %q is not saved; enter it (it can be saved again in the connection settings)", cfg.Name)
+			// stale flag (cannot normally happen: the store syncs it): behave as
+			// "no saved password"
+			return "", model.Errf(model.ErrPasswordNeeded, "the password of %q is not saved; enter it (it will be saved for next time)", cfg.Name)
 		}
 		return v, nil
 	}
@@ -191,12 +192,35 @@ func (m *Manager) Connect(ctx context.Context, id string, password string) (mode
 	m.emit(model.ConnectionStatus{ConnID: id, Connecting: true, ReadOnly: cfg.ReadOnly})
 	p, err := m.openWith(ctx, cfg, pw, true)
 	if err != nil {
+		if cfg.PasswordMode == model.PasswordSave && !cfg.HasPassword && password == "" && cfg.Driver != model.DriverSQLite && isAuthFailure(err) {
+			// "save" mode without a saved password and the server wants one:
+			// ask for it (the UI prompts and calls Connect(id, password))
+			err = model.Errf(model.ErrPasswordNeeded, "the password of %q is not saved; enter it (it will be saved for next time)", cfg.Name)
+		}
 		return m.fail(cfg, err)
+	}
+	if cfg.PasswordMode == model.PasswordSave && password != "" {
+		// a password entered at the prompt for a "save" connection: keep it, now
+		// that it is known to work (a wrong one never gets here)
+		_ = m.store.SaveSecret(id, store.SecretPassword, password)
+		p.Config.HasPassword = true
 	}
 	m.replace(id, p)
 	st := statusOf(p)
 	m.emit(st)
 	return st, nil
+}
+
+// isAuthFailure reports a database login rejected for its credentials.
+func isAuthFailure(err error) bool {
+	msg := err.Error()
+	for _, s := range []string{"Error 1045", "Access denied for user", "SQLSTATE 28P01", "SQLSTATE 28000",
+		"password authentication failed", "no password supplied", "failed SASL auth"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) replace(id string, p *Pool) {

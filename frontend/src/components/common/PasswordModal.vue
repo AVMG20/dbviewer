@@ -16,7 +16,8 @@ const pw = ref("");
     <form class="flex flex-col gap-2" @submit.prevent="ui.resolvePassword(pw)">
       <div class="dim">
         Enter the password for <b class="text-tx">{{ conn?.name }}</b>
-        <span v-if="conn?.user"> ({{ conn.user }})</span>. It is not stored.
+        <span v-if="conn?.user"> ({{ conn.user }})</span>.
+        {{ conn?.passwordMode === "save" ? "It will be saved for next time." : "It is not stored." }}
       </div>
       <input v-model="pw" type="password" class="input !h-6" data-autofocus autocomplete="off" />
     </form>

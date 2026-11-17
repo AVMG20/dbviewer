@@ -28,6 +28,7 @@ type Secrets interface {
 	Get(key string) (string, bool, error)
 	Set(key, value string) error
 	Delete(key string) error
+	All() (map[string]string, error)
 }
 
 // newSecrets returns the secrets store: a JSON file (secrets.json, mode 0600) in
@@ -129,4 +130,10 @@ func (f *fileSecrets) Delete(key string) error {
 	}
 	delete(m, key)
 	return f.save(m)
+}
+
+func (f *fileSecrets) All() (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.load()
 }

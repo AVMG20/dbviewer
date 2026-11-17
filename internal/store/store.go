@@ -246,7 +246,54 @@ func (s *Store) Connections(projectID string) ([]model.ConnectionConfig, error) 
 		c.SortOrder, c.CreatedAt, c.UpdatedAt = so, ca, ua
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if secrets, err := s.secrets.All(); err == nil {
+		for i := range out {
+			if s.syncSecretFlags(&out[i], secrets) {
+				s.storeFlags(out[i])
+			}
+		}
+	}
+	return out, nil
+}
+
+// syncSecretFlags makes hasPassword / ssh.hasPassword / ssh.hasKeyPassphrase
+// reflect whether the secret really exists in the secrets file (flags saved by an
+// older build may point at the Keychain). Reports whether anything changed.
+func (s *Store) syncSecretFlags(c *model.ConnectionConfig, secrets map[string]string) bool {
+	has := func(kind string) bool { _, ok := secrets[secretKey(c.ID, kind)]; return ok }
+	pw, sp, kp := has(secretPassword), has(secretSSHPassword), has(secretSSHPassphrase)
+	changed := c.HasPassword != pw || c.SSH.HasPassword != sp || c.SSH.HasKeyPassphrase != kp
+	c.HasPassword, c.SSH.HasPassword, c.SSH.HasKeyPassphrase = pw, sp, kp
+	return changed
+}
+
+// storeFlags persists the (fixed-up) secret flags of a connection.
+func (s *Store) storeFlags(c model.ConnectionConfig) {
+	c.Password, c.SSH.Password, c.SSH.KeyPassphrase = nil, nil, nil
+	if raw, err := json.Marshal(c); err == nil {
+		_, _ = s.db.Exec(`UPDATE connections SET config = ? WHERE id = ?`, string(raw), c.ID)
+	}
+}
+
+// SaveSecret stores a secret of a saved connection (kind: password |
+// ssh-password | ssh-passphrase) and sets its flag. Used to persist a password
+// entered at connect time once the connect succeeded.
+func (s *Store) SaveSecret(connID, kind, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.secrets.Set(secretKey(connID, kind), value); err != nil {
+		return model.Wrap(model.ErrInternal, err)
+	}
+	c, err := s.Connection(connID)
+	if err != nil {
+		return err
+	}
+	s.storeFlags(c)
+	return nil
 }
 
 func (s *Store) Connection(id string) (model.ConnectionConfig, error) {
@@ -265,6 +312,9 @@ func (s *Store) Connection(id string) (model.ConnectionConfig, error) {
 		return c, err
 	}
 	c.SortOrder, c.CreatedAt, c.UpdatedAt = so, ca, ua
+	if secrets, err := s.secrets.All(); err == nil && s.syncSecretFlags(&c, secrets) {
+		s.storeFlags(c)
+	}
 	return c, nil
 }
 

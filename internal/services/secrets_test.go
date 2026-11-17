@@ -37,15 +37,50 @@ func TestSecretsFileOnly(t *testing.T) {
 	}
 	f.cs.Disconnect(c.ID)
 
-	// legacy: hasPassword set but nothing in the file
+	// legacy: hasPassword set (e.g. saved to the Keychain by an older build) but
+	// nothing in the file: the flag is reported (and stored) as false
 	if err := os.WriteFile(sf, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	if got, _ := f.cs.GetConnection(c.ID); got.HasPassword {
+		t.Fatal("stale hasPassword reported as true (GetConnection)")
+	}
+	if list, _ := f.cs.Connections(""); len(list) != 1 || list[0].HasPassword {
+		t.Fatalf("stale hasPassword reported as true (Connections): %+v", list)
 	}
 	if _, err := f.cs.Connect(f.ctx, c.ID, ""); err == nil || !strings.HasPrefix(err.Error(), model.ErrPasswordNeeded) {
 		t.Fatalf("expected password_required, got %v", err)
 	}
+	// a wrong password at the prompt is not persisted
+	if _, err := f.cs.Connect(f.ctx, c.ID, "wrong-password"); err == nil {
+		t.Fatal("wrong password accepted")
+	}
+	if b, _ := os.ReadFile(sf); strings.Contains(string(b), "wrong-password") {
+		t.Fatal("wrong password persisted")
+	}
+	// the right one is persisted after the successful connect
 	if _, err := f.cs.Connect(f.ctx, c.ID, "dbviewer"); err != nil {
 		t.Fatalf("connect with entered password: %v", err)
+	}
+	if got, _ := f.cs.GetConnection(c.ID); !got.HasPassword {
+		t.Fatal("hasPassword not set after a successful connect with a password")
+	}
+	f.cs.Disconnect(c.ID)
+	if _, err := f.cs.Connect(f.ctx, c.ID, ""); err != nil {
+		t.Fatalf("next connect without a password: %v", err)
+	}
+	// "ask" connections never persist
+	ask := c
+	ask.ID, ask.Name, ask.PasswordMode, ask.Password = "", "ask", model.PasswordAsk, nil
+	ac, err := f.cs.SaveConnection(ask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.cs.Connect(f.ctx, ac.ID, "dbviewer"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := f.cs.GetConnection(ac.ID); got.HasPassword {
+		t.Fatal("ask-mode password persisted")
 	}
 	// saving again stores it in the file
 	c.Password = &pw

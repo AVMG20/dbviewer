@@ -180,6 +180,17 @@ export const useProjectsStore = defineStore("projects", () => {
     return st;
   }
 
+  /** Reloads one connection (e.g. hasPassword after a password was saved at connect). */
+  async function refreshConnection(id: string) {
+    try {
+      const fresh = await connectionApi.GetConnection(id);
+      const i = connections.value.findIndex((c) => c.id === id);
+      if (i >= 0) connections.value[i] = fresh;
+    } catch {
+      /* keep the cached config */
+    }
+  }
+
   async function disconnect(id: string) {
     await connectionApi.Disconnect(id);
   }
@@ -213,11 +224,12 @@ export const useProjectsStore = defineStore("projects", () => {
         await withHostKeyTrust(() => connect(id, pw));
       } catch (e) {
         // "save" mode but no saved password (e.g. it used to be in the Keychain):
-        // ask once and connect with it; saving it again is done in the settings
+        // ask; the backend saves it once the connect succeeds
         if (cfg.passwordMode === "ask" || apiError(e).code !== "password_required") throw e;
         const entered = await ui.askPassword(id);
         if (entered === null) return false;
         await withHostKeyTrust(() => connect(id, entered));
+        await refreshConnection(id);
       }
       return true;
     } catch (e) {
@@ -273,6 +285,6 @@ export const useProjectsStore = defineStore("projects", () => {
     init, setActiveProject, saveProject, deleteProject,
     saveConnection, deleteConnection, duplicateConnection,
     connect, disconnect, testConnection, blankConnection,
-    ensureConnected, withHostKeyTrust, renameProject, reorderProjects, reorderConnections,
+    ensureConnected, withHostKeyTrust, renameProject, reorderProjects, reorderConnections, refreshConnection,
   };
 });

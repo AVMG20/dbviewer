@@ -300,3 +300,36 @@ func TestSSHProxyJumpAlias(t *testing.T) {
 		t.Fatalf("multi-hop: %v", err)
 	}
 }
+
+// A passphrase entered at the prompt for a "save" connection is kept once the
+// connect succeeded; the next app session does not ask again.
+func TestSSHPassphrasePersistedOnConnect(t *testing.T) {
+	f := newFixture(t)
+	startAgent(t)
+	client := genKey(t)
+	keyPath := homeSSH("id_ed25519")
+	writeKey(t, keyPath, client, "correct horse")
+	hk := newSigner(t)
+	srv := startSSHServer(t, hk, "secret", client.signer.PublicKey())
+	trust(t, srv.addr, hk)
+	host, ps, _ := net.SplitHostPort(srv.addr)
+	port, _ := strconv.Atoi(ps)
+	saved := f.save(sshCfg(f, host, port, "tunnel"))
+	if _, err := f.cs.Connect(f.ctx, saved.ID, ""); err == nil || !strings.HasPrefix(err.Error(), model.ErrPassphraseRequired) {
+		t.Fatalf("expected passphrase_required, got %v", err)
+	}
+	if err := f.cs.ProvideKeyPassphrase(keyPath, "correct horse", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.cs.Connect(f.ctx, saved.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	core2, err := NewCore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core2.Close()
+	if _, err := NewConnectionService(core2).Connect(f.ctx, saved.ID, ""); err != nil {
+		t.Fatalf("passphrase not kept for a save connection: %v", err)
+	}
+}

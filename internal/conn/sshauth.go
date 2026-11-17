@@ -99,14 +99,18 @@ var errNeedPassphrase = errors.New("passphrase required")
 // trackedSigner wraps a signer to learn which key the server accepted while
 // keeping the RSA SHA-2 algorithm negotiation of the wrapped signer.
 type trackedSigner struct {
-	inner   ssh.Signer
-	pub     ssh.PublicKey
-	method  string // agent | key
-	label   string
-	lazy    *lazyKey // encrypted key file without passphrase
-	state   *authState
-	attempt int // index into state.tried
-	signed  bool
+	inner  ssh.Signer
+	pub    ssh.PublicKey
+	method string // agent | key
+	label  string
+	lazy   *lazyKey // encrypted key file without passphrase
+	// sessionPass: passphrase taken from this session's cache (entered at the
+	// prompt, not saved); persisted after a successful connect in "save" mode
+	sessionPass string
+	path        string
+	state       *authState
+	attempt     int // index into state.tried
+	signed      bool
 }
 
 type lazyKey struct{ path string }
@@ -201,21 +205,19 @@ func agentSocket(tg sshTarget) (string, string) {
 	return "", "no agent (SSH_AUTH_SOCK not set)"
 }
 
-// passphraseFor returns a known passphrase for a key file ("" if none).
-func (m *Manager) passphraseFor(path string, explicit *string) string {
+// passphraseSource returns a known passphrase for a key file ("" if none) and
+// whether it only came from this session's cache (entered, not saved).
+func (m *Manager) passphraseSource(path string, explicit *string) (string, bool) {
 	if explicit != nil && *explicit != "" {
-		return *explicit
+		return *explicit, false
+	}
+	if v, err := m.store.SSHKeyPassphrase(path); err == nil && v != "" {
+		return v, false
 	}
 	m.keyPass.mu.Lock()
 	p := m.keyPass.m[path]
 	m.keyPass.mu.Unlock()
-	if p != "" {
-		return p
-	}
-	if v, err := m.store.SSHKeyPassphrase(path); err == nil {
-		return v
-	}
-	return ""
+	return p, p != ""
 }
 
 // ProvideKeyPassphrase checks a passphrase against the key file and keeps it for
@@ -263,9 +265,13 @@ func (m *Manager) loadKeyFile(st *authState, path string, explicit *string, meth
 				pub, _, _, _, _ = ssh.ParseAuthorizedKey(b)
 			}
 		}
-		if pass := m.passphraseFor(path, explicit); pass != "" {
+		if pass, fromSession := m.passphraseSource(path, explicit); pass != "" {
 			if s, err := ssh.ParsePrivateKeyWithPassphrase(pem, []byte(pass)); err == nil {
-				return &trackedSigner{inner: s, pub: s.PublicKey(), method: method, label: label, state: st}
+				ts := &trackedSigner{inner: s, pub: s.PublicKey(), method: method, label: label, state: st, path: path}
+				if fromSession {
+					ts.sessionPass = pass
+				}
+				return ts
 			}
 			st.add(method, label, "wrong passphrase")
 			return nil
@@ -548,6 +554,25 @@ func (m *Manager) sshLogin(ctx context.Context, cfg model.ConnectionConfig, t mo
 	return ssh.NewClient(c, chans, reqs), nil
 }
 
+// persistSessionPassphrases saves passphrases entered at the prompt (session
+// cache) for a "save" connection once its connect succeeded: key mode into the
+// connection's ssh-passphrase secret, auto mode per key file.
+func (m *Manager) persistSessionPassphrases(cfg model.ConnectionConfig, st *authState) {
+	if cfg.ID == "" || cfg.PasswordMode != model.PasswordSave {
+		return
+	}
+	for _, s := range st.signers {
+		if !s.signed || s.sessionPass == "" {
+			continue
+		}
+		if cfg.SSH.AuthMethod == "key" {
+			_ = m.store.SaveSecret(cfg.ID, store.SecretSSHPassphrase, s.sessionPass)
+		} else {
+			_ = m.store.SetSSHKeyPassphrase(s.path, s.sessionPass)
+		}
+	}
+}
+
 func (m *Manager) authError(cfg model.ConnectionConfig, tg sshTarget, st *authState, err error) error {
 	if st.needPass != nil {
 		p := *st.needPass
@@ -638,6 +663,9 @@ func (m *Manager) dialSSH(ctx context.Context, cfg model.ConnectionConfig, onLos
 	sess, err := m.openSSH(ctx, cfg)
 	if err != nil {
 		return nil, err
+	}
+	if onLost != nil { // a managed connect (not Test/TestSSH)
+		m.persistSessionPassphrases(cfg, sess.state)
 	}
 	client := sess.client
 	go func() { // keepalive; report a lost tunnel so the pool is dropped
