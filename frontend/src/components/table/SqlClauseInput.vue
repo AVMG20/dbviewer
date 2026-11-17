@@ -126,4 +126,12 @@ defineExpose({ focus: () => view?.focus() });
 .ci-ed:focus-within { border-color: var(--ac); }
 .ci.err .ci-ed { border-color: var(--danger); box-shadow: 0 1px 0 var(--danger); }
 .ci-ed :deep(.cm-editor) { height: 100%; }
+/* single-line field: never scroll vertically, hide the horizontal scrollbar (it still scrolls with the caret) */
+.ci-ed :deep(.cm-scroller) {
+  height: 100%; align-items: center; line-height: 20px !important;
+  overflow-y: hidden !important; overflow-x: auto; scrollbar-width: none;
+}
+.ci-ed :deep(.cm-scroller::-webkit-scrollbar) { display: none; }
+.ci-ed :deep(.cm-content) { padding: 0 6px !important; min-height: 0 !important; }
+.ci-ed :deep(.cm-line) { padding: 0 !important; line-height: 20px; }
 </style>
