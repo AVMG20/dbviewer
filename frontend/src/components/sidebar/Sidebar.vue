@@ -3,7 +3,7 @@
 // (Connection → schema → Tables/Views), speed search, context menus, resize handle.
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useVirtualizer } from "@tanstack/vue-virtual";
-import { apiError, type ConnectionConfig, type Driver } from "@/api";
+import { apiError, type ConnectionConfig, type Driver, type Table } from "@/api";
 import { useProjectsStore } from "@/stores/projects";
 import { useTabsStore } from "@/stores/tabs";
 import { useUiStore } from "@/stores/ui";
@@ -13,7 +13,7 @@ import { shortError } from "@/components/common/errors";
 import Icon from "@/components/common/Icon.vue";
 import Modal from "@/components/common/Modal.vue";
 import ContextMenu, { type MenuItem } from "@/components/common/ContextMenu.vue";
-import { matchTable, normQuery } from "@/components/common/fuzzy";
+import { fuzzy, highlightSegments, normQuery } from "@/components/common/fuzzy";
 import { cache, invalidate, isViewKind, k, loadIndex, loadSchemas, loadTables, qualifiedName } from "./schemaCache";
 
 const projects = useProjectsStore();
@@ -104,7 +104,6 @@ async function refreshConn(id: string) {
   try {
     await loadSchemas(id, true);
     await Promise.all(openSchemas.map((s) => loadTables(id, s, true).catch(() => {})));
-    if (searching.value) await Promise.all(openSchemas.map((s) => loadIndex(id, s, true).catch(() => {})));
   } catch (e) {
     ui.toast(apiError(e).message, "error");
   }
@@ -118,51 +117,25 @@ async function refreshSchema(id: string, s: string) {
 }
 
 // ---- speed search --------------------------------------------------------------
+// A filter over what the tree shows (PhpStorm style): only table / view names of expanded
+// schemas match, nothing gets connected or expanded by it. It stays on while tables are
+// opened from it; Esc clears it. Cmd+K searches everything.
 const speed = ref("");
 const searching = computed(() => speed.value.length > 0);
 
-/** [connId, schema] pairs whose index the search needs. */
-const searchTargets = computed(() => {
-  const out: [string, string][] = [];
-  for (const c of projects.projectConnections) {
-    if (!expanded.has(ckey(c.id)) || !cache.schemas[c.id]) continue;
-    for (const s of visibleSchemas(c.id)) if (expanded.has(skey(c.id, s.name))) out.push([c.id, s.name]);
-  }
-  return out;
-});
-watch(searching, (v) => {
-  if (!v) return;
-  // Connections that are already open join the search without a click.
-  for (const c of projects.projectConnections) {
-    if (projects.isConnected(c.id) && !expanded.has(ckey(c.id))) void expandConn(c.id);
-  }
-});
-watch(
-  [searching, searchTargets],
-  () => {
-    if (!searching.value) return;
-    for (const [c, s] of searchTargets.value) loadIndex(c, s).catch(() => {});
-  },
-  { immediate: true },
-);
-
 interface Hit {
-  name: string;
-  kind: string;
+  table: Table;
   score: number;
   segs: Seg[];
-  hint?: Seg[];
 }
-function searchIndex(connId: string, schema: string): Hit[] | null {
-  const idx = cache.index[k(connId, schema)];
-  if (!idx) return null;
+function filterTables(list: readonly Table[]): Hit[] {
   const q = normQuery(speed.value);
   const hits: Hit[] = [];
-  for (const t of idx) {
-    const m = matchTable(q, t);
-    if (m) hits.push({ name: t.name, kind: t.kind, score: m.score, segs: m.segs, hint: m.hint });
+  for (const t of list) {
+    const m = fuzzy(q, t.name);
+    if (m) hits.push({ table: t, score: m.score, segs: highlightSegments(t.name, m.positions) });
   }
-  hits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  hits.sort((a, b) => b.score - a.score || a.table.name.localeCompare(b.table.name));
   return hits;
 }
 
@@ -185,15 +158,7 @@ const built = computed(() => {
   const q = searching.value;
   for (const c of projects.projectConnections) {
     out.push({ key: ckey(c.id), kind: "conn", level: 0, connId: c.id, name: c.name });
-    if (!expanded.has(ckey(c.id))) {
-      if (q) {
-        out.push({
-          key: `x:${c.id}`, kind: "msg", level: 1, connId: c.id, connect: true,
-          text: projects.statuses[c.id]?.connecting ? "Connecting…" : "Not connected: Enter or click to connect and search",
-        });
-      }
-      continue;
-    }
+    if (!expanded.has(ckey(c.id))) continue;
     if (!cache.schemas[c.id]) {
       out.push(
         cache.errors[c.id]
@@ -210,22 +175,6 @@ const built = computed(() => {
       const base = showSchemas ? lvl + 1 : lvl;
       if (showSchemas && (!q || expanded.has(sk))) out.push({ key: sk, kind: "schema", level: lvl, connId: c.id, schema: s.name, name: s.name });
       if (!expanded.has(sk)) return;
-      if (q) {
-        const hits = searchIndex(c.id, s.name);
-        if (!hits) {
-          out.push({ key: `l:${sk}`, kind: "msg", level: base, connId: c.id, text: "Indexing…" });
-          return;
-        }
-        matches += hits.length;
-        if (!hits.length) out.push({ key: `n:${sk}`, kind: "msg", level: base, connId: c.id, text: "No matches" });
-        for (const h of hits) {
-          out.push({
-            key: tkey(c.id, s.name, h.name), kind: "table", level: base, connId: c.id, schema: s.name,
-            name: h.name, tkind: h.kind, segs: h.segs, hint: h.hint,
-          });
-        }
-        return;
-      }
       const list = cache.tables[k(c.id, s.name)];
       if (!list) {
         out.push(
@@ -235,17 +184,22 @@ const built = computed(() => {
         );
         return;
       }
-      const tbl = list.filter((t) => !isViewKind(t.kind));
-      const vws = list.filter((t) => isViewKind(t.kind));
+      const hits = q ? filterTables(list) : list.map((t) => ({ table: t, segs: undefined }));
+      if (q) {
+        if (!hits.length) out.push({ key: `n:${sk}`, kind: "msg", level: base, connId: c.id, text: "No matches" });
+      }
+      const tbl = hits.filter((h) => !isViewKind(h.table.kind));
+      const vws = hits.filter((h) => isViewKind(h.table.kind));
       for (const [g, items, label] of [["t", tbl, "Tables"], ["v", vws, "Views"]] as const) {
-        if (!items.length && g === "v") continue;
+        if (!items.length && (g === "v" || q)) continue;
         const gk = gkey(c.id, s.name, g);
         out.push({ key: gk, kind: "group", level: base, connId: c.id, schema: s.name, group: g, name: label, count: items.length });
         if (collapsedGroups.has(gk)) continue;
-        for (const t of items) {
+        if (q) matches += items.length;
+        for (const { table: t, segs } of items) {
           out.push({
             key: tkey(c.id, s.name, t.name), kind: "table", level: base + 1, connId: c.id, schema: s.name,
-            name: t.name, tkind: t.kind, estRows: t.estRows,
+            name: t.name, tkind: t.kind, estRows: t.estRows, segs,
           });
         }
       }
@@ -254,13 +208,13 @@ const built = computed(() => {
     for (const s of main) pushSchema(s, 1);
     if (others.length) {
       const open = openOthers.has(c.id);
-      if (!q) {
+      if (!q || (open && others.some((s) => expanded.has(skey(c.id, s.name))))) {
         out.push({
           key: `og:${c.id}`, kind: "group", level: 1, connId: c.id, group: "o", count: others.length,
           name: c.driver === "postgres" ? "Other schemas" : "Other databases",
         });
       }
-      if (open || q) for (const s of others) pushSchema(s, 2);
+      if (open) for (const s of others) pushSchema(s, 2);
     }
   }
   return { rows: out, matches };
@@ -356,7 +310,6 @@ function activate(r: Row, alt = false, viaKey = false) {
       break;
     case "table":
       openTable(r, alt, true, viaKey);
-      if (searching.value) clearSpeed(true);
       break;
     case "msg":
       if (r.connect) void expandConn(r.connId);
@@ -883,9 +836,8 @@ function fitRow(r: Row): { name: Seg[]; hint?: Seg[] } {
   const hl = hint.reduce((n, s) => n + s.t.length, 0) + 3;
   return { name: fitSegs(name, Math.max(10, avail - hl)), hint };
 }
-/** While speed searching the sidebar grows so table names and matched columns stay readable. */
 const dragging = ref(false);
-const effWidth = computed(() => (searching.value ? Math.max(ui.sidebarWidth, 440) : ui.sidebarWidth));
+const effWidth = computed(() => ui.sidebarWidth);
 function accentOf(id: string): string | undefined {
   const c = connOf(id)?.color;
   return c && c !== "none" ? c : undefined;
@@ -1044,7 +996,7 @@ function rowTitle(r: Row): string | undefined {
       <Icon name="search" class="text-ac" />
       <span class="speed-text mono">{{ speed }}</span>
       <span class="dim whitespace-nowrap">{{ matchCount }} match{{ matchCount === 1 ? "" : "es" }}</span>
-      <kbd>esc</kbd>
+      <kbd class="cursor-pointer" title="Clear filter" @click="clearSpeed(true)">esc</kbd>
     </div>
 
     <div class="resize" @mousedown="startResize" @dblclick="ui.sidebarWidth = 268" />

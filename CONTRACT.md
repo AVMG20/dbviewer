@@ -397,7 +397,7 @@ No icon library: use small inline SVG components.
 | Ctrl+Tab / Ctrl+Shift+Tab, Cmd+1..9 | Next/prev/nth tab | shell |
 | Cmd+Shift+F | Find in database | shell (opens modal) |
 | Esc | Close palette/modal/menu; clear sidebar speed search | shell |
-| typing in sidebar tree | speed search | shell |
+| typing in sidebar tree | speed search: filters table/view names of expanded schemas only, stays on after opening a table, Esc clears | shell |
 | Cmd+S | Save staged changes (preview → confirm → apply) | data (TableView) |
 | Cmd+Z | Undo last staged change | data |
 | Cmd+R / F5 | Refresh | data |

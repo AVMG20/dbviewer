@@ -16,7 +16,7 @@
 - **Projects** with multiple connections, each with an optional color that tints its tabs
 - **Read-only connections**, enforced in the UI, the backend and the database session
 - **Staged editing**: inline edits, row inserts and deletes are only written on Save, in one transaction
-- **Sidebar search**: focus the table list and type to match table and column names
+- **Sidebar filter**: focus the table list and type to filter the tables of the open databases; it stays on while you work, Esc clears it
 - **Filtering** with raw SQL `WHERE` / `ORDER BY` (highlighting and completion), quick find, per-column filters
 - **SQL console** with schema-aware autocomplete, history, saved queries and EXPLAIN
 - **Foreign keys**: Cmd/Ctrl-click a value to open the referenced row; mouse back/forward to return
