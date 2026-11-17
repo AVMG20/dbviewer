@@ -592,8 +592,12 @@ interface EditState {
   note?: string;
   canEdit: boolean;
   full?: CellValue;
+  /** number of selected cells the committed value applies to (> 1 = multi-cell edit) */
+  multi?: number;
+  /** the user typed something (multi edits apply even when the text equals the original) */
+  touched?: boolean;
 }
-type Move = "down" | "right" | "left" | "none" | "edit-right" | "edit-left";
+type Move = "down" | "right" | "left" | "none" | "edit-right" | "edit-left" | "none-keep";
 const editing = ref<EditState | null>(null);
 const inlineInput = ref<HTMLInputElement | null>(null);
 let escaping = false;
@@ -641,12 +645,16 @@ async function startEdit(r: number, c: number, typed?: string) {
     emit("edit-blocked");
     return;
   }
-  if (blockedBy(r, c)) return;
-  if (pop) return openPopover(r, c, true);
+  // typing / Enter / F2 with several cells selected edits all of them (per-cell checks happen on commit)
+  const multiN = isSelected(r, c) ? uniqueCellCount() : 1;
+  if (multiN > 1) {
+    if (props.rows[r].state === "deleted") return void toastOnce("Row is marked for deletion", "info");
+  } else if (blockedBy(r, c)) return;
+  if (pop) return openPopover(r, c, true, multiN > 1 ? multiN : undefined);
   const orig = isDefaultValue(v) ? "" : cellText(v);
   const text = typed ?? orig;
   escaping = false;
-  editing.value = { row: r, col: c, text, initial: orig, popover: false, loading: false, canEdit: true };
+  editing.value = { row: r, col: c, text, initial: orig, popover: false, loading: false, canEdit: true, multi: multiN > 1 ? multiN : undefined, touched: typed !== undefined };
   revealCell(r, c);
   await nextTick();
   inlineInput.value?.focus();
@@ -654,13 +662,13 @@ async function startEdit(r: number, c: number, typed?: string) {
   else inlineInput.value?.setSelectionRange(text.length, text.length);
 }
 
-async function openPopover(r: number, c: number, canEdit: boolean) {
+async function openPopover(r: number, c: number, canEdit: boolean, multi?: number) {
   const v = props.rows[r].values[c];
   const truncated = isLongText(v as CellValue) && (v as { truncated: boolean }).truncated;
   const orig = isDefaultValue(v) ? "" : cellText(v);
   const st: EditState = {
     row: r, col: c, text: orig, initial: orig, popover: true, loading: truncated && !!props.loadFull, canEdit,
-    note: undefined,
+    note: undefined, multi,
   };
   if (truncated && !props.loadFull) {
     st.canEdit = false;
@@ -717,6 +725,7 @@ function commitText(text: string, move: Move, refocus = true) {
   const e = editing.value;
   if (!e) return;
   const col = props.columns[e.col];
+  if (e.multi && e.multi > 1) return commitMulti(text, e, move);
   if (text !== e.initial) {
     const err = validateInput(col, text);
     if (err) {
@@ -747,6 +756,47 @@ function commitText(text: string, move: Move, refocus = true) {
   }
   after(e.row, e.col, move);
 }
+/** Applies one typed value to every selected cell as a single staged batch (one undo step). */
+function commitMulti(text: string, e: EditState, move: Move) {
+  const unchanged = !e.touched && text === e.initial;
+  editing.value = null;
+  if (unchanged) return after(e.row, e.col, "none-keep");
+  const edits: CellEdit[] = [];
+  const skips = new Map<string, number>();
+  const skip = (why: string) => skips.set(why, (skips.get(why) ?? 0) + 1);
+  for (const r of selectedRowIndexes()) {
+    const row = props.rows[r];
+    for (const c of selectedColSet.value) {
+      if (!isSelected(r, c)) continue;
+      const col = props.columns[c];
+      const typeName = col.type.replace(/\(.*\)/, "") || col.kind;
+      if (row.state === "deleted") { skip("deleted row"); continue; }
+      if (col.kind === "binary" || isBinary(row.values[c] as CellValue)) { skip("binary"); continue; }
+      if (isLongText(row.values[c] as CellValue) && (row.values[c] as { truncated: boolean }).truncated) { skip("truncated value"); continue; }
+      let v: CellValue;
+      if (text.trim() === "") {
+        if (col.nullable) v = null;
+        else if (NON_TEXT.includes(col.kind)) { skip(`NOT NULL ${typeName}`); continue; }
+        else v = "";
+      } else {
+        if (validateInput(col, text)) { skip(`not valid for ${typeName}`); continue; }
+        v = coerceInput(col, text);
+      }
+      if (cellEquals(row.values[c], v) && row.state !== "new") continue;
+      edits.push({ row: r, col: c, value: v });
+    }
+  }
+  if (edits.length) emit("apply-edits", { edits, appended: [] });
+  const skippedN = [...skips.values()].reduce((a, b) => a + b, 0);
+  if (edits.length || skippedN) {
+    const why = [...skips.keys()].join("; ");
+    toastOnce(
+      `${edits.length ? `Applied to ${edits.length} cell${edits.length > 1 ? "s" : ""}` : "Nothing applied"}${skippedN ? ` · ${skippedN} skipped (${why})` : ""}`,
+      edits.length ? "success" : "warning", 4000, 0,
+    );
+  }
+  after(e.row, e.col, "none-keep");
+}
 function commitValue(value: CellValue) {
   const e = editing.value;
   if (!e) return;
@@ -760,6 +810,7 @@ function commitValue(value: CellValue) {
 function after(r: number, c: number, move: Move) {
   nextTick(() => {
     root.value?.focus({ preventScroll: true });
+    if (move === "none-keep") return; // multi-cell edit: the selection stays as it is
     if (move === "down") selectCell(Math.min(r + 1, props.rows.length - 1), c);
     else if (move === "right") moveHoriz(r, c, 1);
     else if (move === "left") moveHoriz(r, c, -1);
@@ -810,7 +861,10 @@ function onInlineKey(e: KeyboardEvent) {
 }
 /** keep editing.text in sync so a re-render (error bubble) never resets what the user typed */
 function onInlineInput(e: Event) {
-  if (editing.value) editing.value.text = (e.target as HTMLInputElement).value;
+  if (editing.value) {
+    editing.value.text = (e.target as HTMLInputElement).value;
+    editing.value.touched = true;
+  }
   editError.value = "";
 }
 function onInlineBlur(e: FocusEvent) {
@@ -1292,7 +1346,11 @@ const filteredSet = computed(() => new Set(props.filteredCols));
         />
 
         <div
-          v-if="editing && !editing.popover && editStyle && (editError || editPkWarning)" class="dg-edit-msg" :class="{ err: !!editError }"
+          v-if="editing && !editing.popover && editStyle && editing.multi" class="dg-edit-badge"
+          :style="{ left: `calc(${editStyle.left} + ${editStyle.width} + 6px)`, top: editStyle.top }"
+        >→ {{ editing.multi }} cells</div>
+        <div
+          v-if="editing && !editing.popover && editStyle && (editError || editPkWarning) && !editing.multi" class="dg-edit-msg" :class="{ err: !!editError }"
           :style="{ left: editStyle.left, top: HEADER_H + (editing.row + 1) * ROW_H + 2 + 'px' }"
         >{{ editError || editPkWarning }}</div>
         <div v-if="!rows.length && !loading" class="dg-empty dim" :style="{ top: HEADER_H + 24 + 'px' }">{{ emptyText }}</div>
@@ -1309,7 +1367,7 @@ const filteredSet = computed(() => new Set(props.filteredCols));
       :title="popTitle" :type="columns[editing.col].type" :kind="columns[editing.col].kind"
       :initial="editing.text" :loading="editing.loading" :note="editing.note"
       :can-edit="editing.canEdit && editable" :nullable="columns[editing.col].nullable"
-      :error="editError" :warning="editPkWarning"
+      :error="editError" :warning="editPkWarning" :multi-count="editing.multi"
       @commit="(t) => commitText(t, 'none')"
       @set-null="commitValue(null)"
       @set-default="commitValue(SQL_DEFAULT)"
@@ -1390,6 +1448,7 @@ const filteredSet = computed(() => new Set(props.filteredCols));
   position: absolute; z-index: 5; box-sizing: border-box; background: var(--bg); border: 1px solid var(--ac); outline: none;
   padding: 0 7px; font: 12px var(--mono); color: var(--tx); border-radius: 0;
 }
+.dg-edit-badge { position: absolute; z-index: 6; height: 22px; line-height: 22px; padding: 0 8px; border-radius: 4px; font: 600 11px var(--sans); background: var(--ac); color: var(--ac-fg, #fff); white-space: nowrap; pointer-events: none; }
 .dg-edit-msg { position: absolute; z-index: 6; padding: 2px 8px; border-radius: 4px; font: 11px var(--sans); background: var(--bg2); border: 1px solid var(--bd); color: var(--warn); box-shadow: 0 4px 12px var(--shadow); pointer-events: none; white-space: nowrap; }
 .dg-edit-msg.err { color: #fff; background: var(--danger); border-color: var(--danger); }
 .dg-empty { position: absolute; left: 0; right: 0; text-align: center; font-family: var(--sans); }

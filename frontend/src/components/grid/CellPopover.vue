@@ -19,6 +19,8 @@ const props = defineProps<{
   nullable: boolean;
   error?: string;
   warning?: string;
+  /** > 1: Apply writes the value to all selected cells */
+  multiCount?: number;
 }>();
 const emit = defineEmits<{
   commit: [text: string];
@@ -94,7 +96,7 @@ function formatJson() {
 }
 /** Apply: stages the text. Identical to the original = nothing to stage. */
 function commit() {
-  if (text.value === props.initial) emit("cancel");
+  if (text.value === props.initial && !props.multiCount) emit("cancel");
   else emit("commit", text.value);
 }
 
@@ -153,6 +155,7 @@ function minify() {
         <span class="mono truncate">{{ title }}</span>
         <span class="dim mono">{{ type }}</span>
         <span class="flex-1"></span>
+        <span v-if="multiCount" class="pop-multi">→ {{ multiCount }} cells</span>
         <span class="dim mono">{{ text.length.toLocaleString("en-US") }} chars</span>
         <select v-model="lang" class="pop-lang" title="Language (highlighting)">
           <option value="text">Text</option><option value="json">JSON</option><option value="xml">XML</option>
@@ -190,6 +193,7 @@ function minify() {
 }
 .pop-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px 5px 12px; border-bottom: 1px solid var(--bd); }
 .pop-note { padding: 4px 12px; color: var(--warn); border-bottom: 1px solid var(--bd); font-size: 11px; }
+.pop-multi { font: 600 11px var(--sans); padding: 0 7px; border-radius: 4px; background: var(--ac); color: var(--ac-fg, #fff); line-height: 18px; }
 .pop-lang { height: 20px; font-size: 11px; padding: 0 2px; border: 1px solid var(--bd); border-radius: 4px; background: var(--bg); color: var(--tx); }
 .pop-err { padding: 4px 12px; color: #fff; background: var(--danger); font-size: 11px; }
 .pop-loading { flex: 1; padding: 12px; }
