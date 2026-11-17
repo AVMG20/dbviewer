@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f3036"/>
+      <stop offset="1" stop-color="#18181b"/>
+    </linearGradient>
+    <linearGradient id="disc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4a7fe6"/>
+      <stop offset="0.5" stop-color="#6b9cf5"/>
+      <stop offset="1" stop-color="#3f6fd0"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9dbdfb"/>
+      <stop offset="1" stop-color="#6b9cf5"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS icon grid: 824x824 rounded square centred in 1024 -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="184.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <!-- database cylinder: three stacked discs -->
+  <g transform="translate(512 0)">
+    <path d="M-210 610 v80 a210 62 0 0 0 420 0 v-80 a210 62 0 0 1 -420 0 z" fill="url(#disc)" opacity="0.85"/>
+    <path d="M-210 480 v80 a210 62 0 0 0 420 0 v-80 a210 62 0 0 1 -420 0 z" fill="url(#disc)" opacity="0.92"/>
+    <path d="M-210 350 v80 a210 62 0 0 0 420 0 v-80 a210 62 0 0 1 -420 0 z" fill="url(#disc)"/>
+    <ellipse cx="0" cy="350" rx="210" ry="62" fill="url(#top)"/>
+    <ellipse cx="0" cy="350" rx="150" ry="36" fill="#ffffff" fill-opacity="0.18"/>
+  </g>
+</svg>

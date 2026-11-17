@@ -1,0 +1,103 @@
+/* Global styles (owned by the "shell" agent). */
+@import "tailwindcss";
+@import "./theme.css";
+
+/* Expose theme tokens to Tailwind: bg-bg2, text-dim, border-bd, text-danger, font-mono ... */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg2: var(--bg2);
+  --color-bg3: var(--bg3);
+  --color-bd: var(--bd);
+  --color-bd2: var(--bd2);
+  --color-pop: var(--pop);
+  --color-head: var(--head);
+  --color-tx: var(--tx);
+  --color-dim: var(--dim);
+  --color-ac: var(--ac);
+  --color-hov: var(--hov);
+  --color-selbg: var(--selbg);
+  --color-selbd: var(--selbd);
+  --color-danger: var(--danger);
+  --color-warn: var(--warn);
+  --color-ok: var(--ok);
+  --color-pk: var(--pk);
+  --color-fk: var(--fk);
+  --font-mono: var(--mono);
+  --font-sans: var(--sans);
+}
+
+html, body, #app { margin: 0; height: 100%; overflow: hidden; }
+body {
+  background: var(--bg);
+  color: var(--tx);
+  font: 12.5px/1.4 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+input, textarea, [contenteditable], .selectable { user-select: text; -webkit-user-select: text; }
+button, input, select, textarea { font: inherit; color: inherit; }
+
+/* Wails drag region: the custom title bar sets this; interactive children opt out. */
+.drag { --wails-draggable: drag; }
+.no-drag { --wails-draggable: no-drag; }
+
+/* Base controls (T3 style: soft radius, hairline borders, restrained glow) */
+.btn {
+  background: var(--bg3); border: 1px solid var(--bd); border-radius: var(--r); padding: 0 10px; height: var(--ctl);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; cursor: default;
+  color: var(--tx); transition: background .12s, border-color .12s, box-shadow .12s;
+}
+.btn:hover:not(:disabled) { background: var(--hov); border-color: var(--bd2); }
+.btn:disabled { opacity: .45; }
+.btn.ghost { background: none; border-color: transparent; padding: 0 7px; color: var(--dim); }
+.btn.ghost:hover:not(:disabled) { background: var(--hov); border-color: transparent; color: var(--tx); }
+.btn.ghost:disabled { color: var(--dim); opacity: .5; }
+.btn.icon { padding: 0; width: var(--ctl); }
+.btn.primary {
+  background: var(--ac); border-color: var(--ac); color: var(--ac-fg, #fff); font-weight: 600;
+  box-shadow: 0 2px 12px -2px var(--glow);
+}
+.btn.primary:hover:not(:disabled) { background: var(--ac); border-color: var(--ac); filter: brightness(1.1); }
+.btn.primary:disabled { box-shadow: none; background: var(--bg3); border-color: var(--bd); color: var(--dim); opacity: .8; filter: none; }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn:focus-visible { outline: none; border-color: var(--ac); box-shadow: 0 0 0 3px var(--ring); }
+.input {
+  background: var(--bg2); border: 1px solid var(--bd); border-radius: var(--r); padding: 0 10px; height: var(--ctl);
+  outline: none; min-width: 0; color: var(--tx);
+}
+.input::placeholder { color: var(--dim); opacity: .7; }
+.input:focus { border-color: var(--ac); box-shadow: 0 0 0 3px var(--ring); }
+select.input { color-scheme: inherit; }
+kbd {
+  font: 10px var(--mono); border: 1px solid var(--bd); border-radius: 5px; padding: 0 5px; color: var(--dim);
+  background: var(--bg3);
+}
+/* Keycaps inside buttons inherit the button colour so they stay readable on every variant. */
+.btn kbd, button.btn kbd {
+  color: inherit; background: color-mix(in srgb, currentColor 14%, transparent);
+  border-color: color-mix(in srgb, currentColor 32%, transparent);
+}
+.btn.primary kbd, .btn.danger kbd { color: var(--ac-fg, #fff); background: color-mix(in srgb, var(--ac-fg, #fff) 18%, transparent); border-color: color-mix(in srgb, var(--ac-fg, #fff) 40%, transparent); }
+.btn.danger kbd { color: #fff; }
+.btn.ghost kbd { color: var(--dim); }
+.mono { font-family: var(--mono); }
+.dim { color: var(--dim); }
+.null { color: var(--dim); font-style: italic; }
+.badge {
+  font: 600 9px var(--mono); padding: 1px 6px; border-radius: 99px; background: var(--bg3); color: var(--dim);
+  border: 1px solid var(--bd); letter-spacing: .03em;
+}
+.pill {
+  font: 600 10px var(--mono); letter-spacing: .04em; padding: 1px 8px; border-radius: 99px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+}
+.pill.neutral { background: var(--bg3); color: var(--dim); border-color: var(--bd); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--bd); border-radius: 5px; border: 2px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-corner { background: transparent; }

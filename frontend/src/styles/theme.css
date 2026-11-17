@@ -1,0 +1,170 @@
+/* Theme tokens (owned by the "shell" agent). Dark is the default; light is
+   applied with <html data-theme="light">. Values follow the mockup. */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0e0e10;        /* canvas: main surface, grid, editor */
+  --bg2: #131315;       /* panels: sidebar, title bar, tab bar, status bar, grid header */
+  --bg3: #1a1a1d;       /* controls: buttons, badges, chips */
+  --bd: #ffffff12;      /* hairline borders */
+  --bd2: #ffffff22;     /* stronger borders: hover, header underline, popovers */
+  --tx: #f4f4f5;
+  --dim: #8b8b93;
+  --ac: #3b82f6;        /* accent (overridden per connection via data-accent) */
+  --hov: #ffffff0b;
+  --selbg: #3b82f624;   /* selected row / menu item fill */
+  --selbd: #3b82f6;     /* selection border */
+  --cellbg: #3b82f633;  /* active cell fill */
+  --cell-bd: #ffffff08; /* vertical grid lines */
+  --row-bd: #ffffff0b;  /* horizontal row separators */
+  --head: #131315;      /* grid header */
+  --pop: #17171a;       /* popovers, menus, modals, palette */
+  --scrim: #00000088;
+  --shadow: #000000aa;
+  --glow: #3b82f666;    /* primary button glow (used sparingly) */
+  --ring: #3b82f640;    /* focus ring */
+  --r: 9px;             /* control radius */
+  --ctl: 28px;          /* control height */
+  --rowh: 28px;
+  --rowh2: 28px;
+
+  --chg-edit: #e3a73a44;
+  --mark: #e3a73a77;    /* quick-find highlight */
+
+  /* semantic */
+  --danger: #f85149;
+  --warn: #e3a73a;
+  --ok: #3fb950;
+  --pk: #e3a73a;
+  --fk: #6cb2ff;
+
+  /* SQL syntax (CodeMirror theme) */
+  --syn-keyword: #c678dd;
+  --syn-string: #98c379;
+  --syn-number: #d19a66;
+  --syn-comment: var(--dim);
+  --syn-ident: var(--tx);
+  --syn-func: #61afef;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg2: #f8f8f9;
+  --bg3: #f0f0f2;
+  --bd: #0000001a;
+  --bd2: #00000030;
+  --tx: #0f0f11;
+  --dim: #70707a;
+  --ac: #2563eb;
+  --hov: #0000000a;
+  --selbg: #2563eb1a;
+  --selbd: #2563eb;
+  --cellbg: #2563eb2b;
+  --cell-bd: #00000008;
+  --row-bd: #0000000d;
+  --head: #f8f8f9;
+  --pop: #ffffff;
+  --scrim: #00000044;
+  --shadow: #00000033;
+  --glow: #2563eb55;
+  --ring: #2563eb33;
+
+  --chg-edit: #bf870055;
+  --mark: #bf870066;
+
+  --danger: #cf222e;
+  --warn: #9a6700;
+  --ok: #1a7f37;
+  --pk: #9a6700;
+  --fk: #0969da;
+
+  --syn-keyword: #a626a4;
+  --syn-string: #3f8a3e;
+  --syn-number: #b76b01;
+  --syn-func: #4078f2;
+}
+
+:root {
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+
+  /* Connection colors (ConnectionConfig.color). "none" = no tint. */
+  --conn-none: transparent;
+  --conn-green: #3fb950;
+  --conn-yellow: #e3a73a;
+  --conn-orange: #db6d28;
+  --conn-red: #f85149;
+  --conn-blue: #58a6ff;
+  --conn-purple: #a371f7;
+
+  /* Layout metrics */
+  --titlebar-h: 38px;     /* macOS hidden-inset title bar, traffic lights overlay the left */
+  --traffic-w: 78px;      /* left inset reserved for the traffic lights */
+  --sidebar-w: 268px;
+  --tabbar-h: 30px;
+  --statusbar-h: 22px;
+  --row-h: 22px;          /* grid / tree row height */
+}
+
+/* Connection tint helpers: set --conn on an ancestor (e.g. style="--conn: var(--conn-red)"). */
+.conn-tint-bg { background: color-mix(in srgb, var(--conn, transparent) 14%, transparent); }
+.conn-tint-border { border-color: var(--conn, var(--bd)) !important; }
+.conn-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block;
+  border: 1px solid var(--dim); background: var(--conn, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--conn, transparent) 18%, transparent);
+}
+
+/* Per-connection accent: set data-accent="<color>" on a tab view container / tab / row.
+   Overrides the accent tokens (border, focus ring, stripe, primary buttons). The selection
+   FILL stays neutral on purpose, so it never looks like a staged-change tint. */
+:root { --ac-fg: #fff; }
+[data-accent="green"]  { --ac: var(--conn-green);  --ac-fg: #08210f; }
+[data-accent="yellow"] { --ac: var(--conn-yellow); --ac-fg: #241a00; }
+[data-accent="orange"] { --ac: var(--conn-orange); --ac-fg: #261000; }
+[data-accent="red"]    { --ac: var(--conn-red);    --ac-fg: #fff; }
+[data-accent="blue"]   { --ac: var(--conn-blue);   --ac-fg: #06182e; }
+[data-accent="purple"] { --ac: var(--conn-purple); --ac-fg: #fff; }
+[data-accent="green"], [data-accent="yellow"], [data-accent="orange"],
+[data-accent="red"], [data-accent="blue"], [data-accent="purple"] {
+  --selbd: var(--ac);
+  --selbg: color-mix(in srgb, var(--ac) 14%, transparent);
+  --cellbg: color-mix(in srgb, var(--ac) 25%, transparent);
+  --glow: color-mix(in srgb, var(--ac) 40%, transparent);
+  --ring: color-mix(in srgb, var(--ac) 27%, transparent);
+  --ac-bg: color-mix(in srgb, var(--ac) 14%, transparent);
+}
+/* Light theme: connection colors are darker, so white text works on all of them. */
+:root[data-theme="light"] [data-accent] { --ac-fg: #fff; }
+:root[data-theme="light"] {
+  --conn-green: #1f8a3a;
+  --conn-yellow: #a87500;
+  --conn-orange: #c4570f;
+  --conn-red: #cf222e;
+  --conn-blue: #1f6feb;
+  --conn-purple: #8250df;
+}
+
+/* Staged changes: tint + 2px left bar. Neutral to the connection accent colors (the accent
+   only ever draws borders / stripes), so the tint plus bar reads as "changed", not "selected". */
+:root {
+  --chg-upd: #e3a73a;  --chg-upd-bg: #e3a73a2b;
+  --chg-new: #3fb950;  --chg-new-bg: #3fb9502a;
+  --chg-del: #f85149;  --chg-del-bg: #f851492e;
+}
+:root[data-theme="light"] {
+  --chg-upd: #9a6700;  --chg-upd-bg: #bf870030;
+  --chg-new: #1a7f37;  --chg-new-bg: #2da44e2a;
+  --chg-del: #cf222e;  --chg-del-bg: #cf222e24;
+}
+
+/* z-index scale (popover < menu < modal < palette < toast) */
+:root {
+  --z-popover: 40;
+  --z-menu: 45;
+  --z-modal: 50;
+  --z-palette: 55;
+  --z-toast: 60;
+}
