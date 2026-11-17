@@ -19,6 +19,8 @@ const emit = defineEmits<{
 
 const host = ref<HTMLElement | null>(null);
 let view: EditorView | null = null;
+/** applying modelValue from the parent: not an edit, so it must not be echoed back as one */
+let syncing = false;
 const roConf = new Compartment();
 const phConf = new Compartment();
 const ro = (r?: boolean) => [EditorState.readOnly.of(!!r), EditorView.editable.of(true)];
@@ -50,7 +52,7 @@ onMounted(() => {
         roConf.of(ro(props.readOnly)),
         phConf.of(props.placeholder ? cmPlaceholder(props.placeholder) : []),
         EditorView.updateListener.of((u) => {
-          if (u.docChanged) emit("update:modelValue", u.state.doc.toString());
+          if (u.docChanged && !syncing) emit("update:modelValue", u.state.doc.toString());
           if (u.focusChanged && !u.view.hasFocus) emit("commit");
         }),
         EditorView.domEventHandlers({
@@ -69,7 +71,15 @@ onBeforeUnmount(() => {
 });
 
 watch(() => props.modelValue, (v) => {
-  if (view && v !== view.state.doc.toString()) view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: v } });
+  if (!view || v === view.state.doc.toString()) return;
+  // Echoed, the parent would keep the stored value as a draft that hides later changes (grid
+  // edit, undo, revert) and re-stages it on the next blur.
+  syncing = true;
+  try {
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: v } });
+  } finally {
+    syncing = false;
+  }
 });
 watch(() => props.readOnly, (r) => view?.dispatch({ effects: roConf.reconfigure(ro(r)) }));
 watch(() => props.placeholder, (p) => view?.dispatch({ effects: phConf.reconfigure(p ? cmPlaceholder(p) : []) }));

@@ -6,15 +6,16 @@ package sqltok
 type Info struct {
 	Class
 	// Writes is set when the statement changes data or the schema (DML, DDL,
-	// GRANT/REVOKE, CALL/DO/EXECUTE, data-modifying WITH, EXPLAIN ANALYZE of DML,
-	// SELECT … INTO). Session settings and transaction control (SET, USE, BEGIN,
+	// GRANT/REVOKE, CALL/DO/EXECUTE, VACUUM/REINDEX/…, data-modifying WITH, EXPLAIN
+	// ANALYZE of DML, SELECT … INTO, state-changing functions such as setval(), SQLite
+	// PRAGMAs that set a value). Session settings and transaction control (SET, USE, BEGIN,
 	// COMMIT, …) are not writes.
 	Writes bool
 	// Table is the first table the statement references, unquoted, as written
 	// ("" when there is none, e.g. SELECT 1).
 	Table string
-	// NoWhere is set for an UPDATE / DELETE without WHERE (and without LIMIT or
-	// JOIN): it affects every row of the table.
+	// NoWhere is set for an UPDATE / DELETE without WHERE (and without LIMIT or a
+	// MySQL inner JOIN of the target): it affects every row of the table.
 	NoWhere bool
 	// TargetSchema / TargetTable are set for a NoWhere statement on exactly one
 	// plain table (no WITH, UPDATE … FROM, DELETE … USING, ONLY, multi-table
@@ -29,6 +30,9 @@ var writeMain = map[string]bool{
 	"truncate": true, "create": true, "alter": true, "drop": true, "rename": true, "grant": true,
 	"revoke": true, "comment": true, "copy": true, "load": true, "call": true, "do": true,
 	"execute": true, "import": true, "refresh": true,
+	// rewrite or rebuild tables / indexes, change ownership, create database files
+	"vacuum": true, "reindex": true, "cluster": true, "optimize": true, "repair": true, "reassign": true,
+	"attach": true,
 }
 
 var dmlWords = map[string]bool{"insert": true, "update": true, "delete": true, "merge": true}
@@ -50,7 +54,7 @@ func Inspect(dialect string, toks []Token) Info {
 	for start < len(toks) && toks[start].Kind == Punct && toks[start].Text == "(" {
 		start++
 	}
-	in.Writes = writes(in.Class, toks)
+	in.Writes = writes(dialect, in.Class, toks)
 	in.Table = firstTable(toks[start:], cteNames(in.Class, toks[start:]))
 	if in.Main == "update" || in.Main == "delete" {
 		inspectTarget(dialect, &in, toks[start:])
@@ -58,29 +62,44 @@ func Inspect(dialect string, toks []Token) Info {
 	return in
 }
 
-func writes(c Class, toks []Token) bool {
+func writes(dialect string, c Class, toks []Token) bool {
 	if writeMain[c.Main] {
 		return true
 	}
 	switch c.First {
-	case "with": // data-modifying CTE: WITH d AS (DELETE … RETURNING *) SELECT …
+	case "with": // data-modifying CTE: WITH d AS (DELETE … RETURNING *) SELECT …; WITH … SELECT … INTO
 		for k, t := range toks {
-			if t.Kind == Word && dmlWords[t.Lower] && !(k > 0 && (toks[k-1].Is("for") || toks[k-1].Is("key"))) {
+			if t.Kind == Word && dmlWords[t.Lower] && !(k > 0 && (toks[k-1].Is("for") || toks[k-1].Is("key"))) || t.Is("into") {
 				return true
 			}
 		}
+		return callsWriteFunc(toks)
 	case "explain": // EXPLAIN ANALYZE executes the statement
 		analyze, dml := false, false
 		for k, t := range toks {
 			analyze = analyze || t.Is("analyze")
 			dml = dml || t.Kind == Word && dmlWords[t.Lower] && !(k > 0 && (toks[k-1].Is("for") || toks[k-1].Is("key")))
 		}
-		return analyze && dml
-	case "select": // SELECT … INTO new_table / OUTFILE
+		return analyze && (dml || callsWriteFunc(toks))
+	case "select", "values": // SELECT … INTO new_table / OUTFILE; SELECT setval(…)
 		for _, t := range toks {
 			if t.Is("into") {
 				return true
 			}
+		}
+		return callsWriteFunc(toks)
+	case "pragma": // PRAGMA user_version = 1, PRAGMA journal_mode = WAL, …
+		return dialect == SQLite && pragmaReason(toks) != ""
+	}
+	return false
+}
+
+// callsWriteFunc reports a call of a state-changing function (setval, dblink_exec,
+// pg_terminate_backend, lo_unlink, …: the read-only check's list) in a read statement.
+func callsWriteFunc(toks []Token) bool {
+	for k, t := range toks {
+		if (t.Kind == Word || t.Kind == Ident) && k+1 < len(toks) && toks[k+1].Kind == Punct && toks[k+1].Text == "(" && isWriteFunc(t.Lower) {
+			return true
 		}
 	}
 	return false
@@ -249,7 +268,8 @@ func inspectTarget(dialect string, in *Info, toks []Token) {
 	depth := 0
 	var where, limit, join, from, multi bool
 	seenSet := false
-	for _, t := range toks[mainIdx+1:] {
+	body := toks[mainIdx+1:]
+	for k, t := range body {
 		if t.Kind == Punct {
 			switch t.Text {
 			case "(":
@@ -273,7 +293,12 @@ func inspectTarget(dialect string, in *Info, toks []Token) {
 		case "limit":
 			limit = true
 		case "join":
-			join = true
+			// Only MySQL's multi-table syntax joins the target itself, and only an inner join
+			// narrows its rows. Elsewhere a JOIN sits in FROM / USING, which is cross joined
+			// with the target: without WHERE every row is still affected.
+			if dialect == MySQL && !(k > 0 && (body[k-1].Is("left") || body[k-1].Is("right") || body[k-1].Is("outer") || body[k-1].Is("cross"))) {
+				join = true
+			}
 		case "set":
 			seenSet = true
 		case "from":

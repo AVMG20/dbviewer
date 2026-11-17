@@ -68,6 +68,8 @@ const gridEl = ref<InstanceType<typeof DataGrid> | null>(null);
 const resMenu = ref<{ x: number; y: number } | null>(null);
 let runningId = "";
 let userCanceled = false;
+/** between Run and the actual start: classification, row counts and the confirmation dialog */
+let preparing = false;
 let elapsedTimer: number | undefined;
 const elapsedMs = ref(0);
 let inflight: { cancel: () => void } | null = null;
@@ -186,6 +188,17 @@ async function runAll() {
 async function execute(sql: string, offset: number) {
   if (!sql.trim()) return;
   if (running.value) return ui.toast("A query is already running", "info", 1500);
+  // A second Run while the first one is still being checked would ask again and, with both
+  // confirmed, run the statement twice (e.g. an UPDATE without WHERE).
+  if (preparing) return;
+  preparing = true;
+  try {
+    await prepareAndRun(sql, offset);
+  } finally {
+    preparing = false;
+  }
+}
+async function prepareAndRun(sql: string, offset: number) {
   if (readOnly.value) {
     const bad = stripComments(sql).split(";").find((s) => WRITE_RE.test(s));
     if (bad) {
@@ -197,7 +210,6 @@ async function execute(sql: string, offset: number) {
   }
   if (!(await projects.ensureConnected(connId.value))) return;
   const stmts = await analyze(sql);
-  if (running.value) return; // started meanwhile (double Cmd+Enter)
   if (!(await confirmRisky(stmts))) return;
   if (running.value) return;
   // a new run clears the previous result / error panel at once and shows a running state

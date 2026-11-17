@@ -9,6 +9,7 @@ import { useVirtualizer } from "@tanstack/vue-virtual";
 import type { CellValue, Driver, ResultColumn } from "@/api";
 import { isBinary, isLongText, SQL_DEFAULT } from "@/api";
 import { useUiStore } from "@/stores/ui";
+import { useTabsStore } from "@/stores/tabs";
 import { copyText, readClipboardText } from "@/lib/clipboard";
 import { isMod } from "@/lib/keys";
 import { toastOnce } from "@/lib/notify";
@@ -65,6 +66,7 @@ const emit = defineEmits<{
 }>();
 
 const ui = useUiStore();
+const tabsStore = useTabsStore();
 
 // ---- geometry ---------------------------------------------------------------
 const scroller = ref<HTMLElement | null>(null);
@@ -290,6 +292,8 @@ function scheduleStats() {
 const STATS_MAX_CELLS = 500_000;
 function computeStats() {
   const tabId = ownTabId();
+  // one shared slot: a grid in a background tab (rows reloaded) must not replace the active tab's stats
+  if (tabId && tabId !== tabsStore.activeId) return;
   const rs = ranges.value;
   const cells = uniqueCellCount();
   if (!tabId || cells < 2 || cells > STATS_MAX_CELLS) {
@@ -328,6 +332,8 @@ function computeStats() {
 }
 // rows edited / reloaded under an unchanged selection
 watch(() => props.rows, scheduleStats);
+// back on this tab: its selection is still there, the status bar shows another tab's stats (or none)
+watch(() => tabsStore.activeId, (id) => id && id === ownTabId() && scheduleStats());
 onBeforeUnmount(() => {
   clearTimeout(statsTimer);
   const id = ownTabId();

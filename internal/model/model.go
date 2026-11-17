@@ -449,7 +449,7 @@ type StatementRange struct {
 	Writes bool `json:"writes"`
 	// Table: first table the statement references, unquoted ("" = none).
 	Table string `json:"table"`
-	// NoWhere: UPDATE / DELETE without WHERE (or LIMIT / JOIN): affects every row.
+	// NoWhere: UPDATE / DELETE without WHERE (or LIMIT / MySQL inner JOIN): affects every row.
 	NoWhere bool `json:"noWhere"`
 	// TargetSchema / TargetTable: the one plain table of a NoWhere statement (unquoted, as
 	// stored; schema "" = default), so its row count can be shown. Empty when not that simple.

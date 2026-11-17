@@ -31,7 +31,7 @@
 //        after each load / query, e.g. ui.setStatus({ tabId: tab.id, durationMs: r.durationMs, rows: r.rows.length, total: r.total }).
 //        Fields not given keep their previous value; clearStatus(tabId) resets.
 //   sidebarWidth, sidebarVisible, toggleSidebar(); loadPrefs() (called by App)
-//   revealRequest / revealInSidebar(connId, schema?, table?, column?): expands the tree to the object
+//   revealRequest / revealInSidebar(connId, schema?, table?, column?, focus = true): expands the tree to the object
 //        (with a column: expands the table and selects the column row)
 //   focusColumnRequest / focusColumn(connId, schema, table, column): the matching table view
 //        scrolls to and selects that column (palette column hits)
@@ -65,6 +65,8 @@ export interface RevealRequest {
   schema?: string;
   table?: string;
   column?: string;
+  /** false: select the row without moving keyboard focus into the tree (default true) */
+  focus?: boolean;
 }
 
 export interface FocusColumnRequest {
@@ -119,6 +121,8 @@ export const useUiStore = defineStore("ui", () => {
   /** Repeat counts of collapsed identical toasts ("... ×5"), by toast id. */
   const toastCounts = ref<Record<number, number>>({});
   const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** toasts kept until dismissed (pinToast): a repeat of the same message must not re-arm a timer */
+  const pinnedToasts = new Set<number>();
   function toast(message: string, kind: ToastKind = "info", timeout?: number, opts?: ToastOptions): number {
     const t = timeout ?? (kind === "error" ? (opts?.actions?.length ? 12000 : 6000) : 3000);
     const same = toasts.value.find((x) => x.message === message && x.kind === kind);
@@ -126,6 +130,9 @@ export const useUiStore = defineStore("ui", () => {
     if (same) {
       toastCounts.value = { ...toastCounts.value, [id]: (toastCounts.value[id] ?? 1) + 1 };
       clearTimeout(toastTimers.get(id));
+      // the latest actions win (e.g. Retry of another connection with the same name)
+      if (opts) Object.assign(same, opts);
+      if (pinnedToasts.has(id)) return id;
     } else {
       toasts.value.push({ id, message, kind, timeout: t, ...opts });
       if (toasts.value.length > 5) dismissToast(toasts.value[0].id);
@@ -137,8 +144,10 @@ export const useUiStore = defineStore("ui", () => {
   function pinToast(id: number) {
     clearTimeout(toastTimers.get(id));
     toastTimers.delete(id);
+    pinnedToasts.add(id);
   }
   function dismissToast(id: number) {
+    pinnedToasts.delete(id);
     toasts.value = toasts.value.filter((t) => t.id !== id);
     clearTimeout(toastTimers.get(id));
     toastTimers.delete(id);
@@ -301,9 +310,9 @@ export const useUiStore = defineStore("ui", () => {
 
   const revealRequest = ref<RevealRequest | null>(null);
   let revealSeq = 0;
-  function revealInSidebar(connId: string, schema?: string, table?: string, column?: string) {
+  function revealInSidebar(connId: string, schema?: string, table?: string, column?: string, focus = true) {
     sidebarVisible.value = true;
-    revealRequest.value = { seq: ++revealSeq, connId, schema, table, column };
+    revealRequest.value = { seq: ++revealSeq, connId, schema, table, column, focus };
   }
   const focusColumnRequest = ref<FocusColumnRequest | null>(null);
   let focusColSeq = 0;

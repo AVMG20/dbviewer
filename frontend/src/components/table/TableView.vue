@@ -743,6 +743,8 @@ watch(
   async ([req]) => {
     if (!req || req.seq <= focusColSeq || !isThisTable(req) || !columns.value.length) return;
     focusColSeq = req.seq;
+    // consumed: a view of this table opened later (new component, seq starts at 0) must not replay it
+    ui.focusColumnRequest = null;
     const ci = columns.value.findIndex((c) => c.name === req.column);
     if (ci < 0) return;
     await nextTick();

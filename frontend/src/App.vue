@@ -54,6 +54,8 @@ watch(() => projects.activeProjectId, (id) => id && void loadRecent(id), { immed
 watch(
   () => tabs.active,
   (t) => {
+    // the old project's tabs are still shown while a project switch restores the new ones
+    if (projects.getConnection(t?.connId ?? "")?.projectId !== projects.activeProjectId) return;
     if (t?.table && (t.kind === "table" || t.kind === "structure")) pushRecent({ kind: t.kind, connId: t.connId, schema: t.schema ?? "", table: t.table });
   },
 );
@@ -109,8 +111,12 @@ function onKeyCapture(e: KeyboardEvent) {
     ui.openModal("settings");
     return;
   }
-  const inText = !!(e.target as HTMLElement | null)?.closest("input, textarea, select, [contenteditable='true'], .cm-editor");
-  if ((mod && !e.altKey && e.key === "/") || (e.key === "?" && !mod && !e.altKey && !inText)) {
+  const target = e.target as HTMLElement | null;
+  const inText = !!target?.closest("input, textarea, select, [contenteditable='true'], .cm-editor");
+  // Mod+/ in the SQL editor toggles a comment; a typed "?" in the grid starts editing a cell and in
+  // the sidebar tree extends the speed search
+  const typing = inText || !!target?.closest(".dg, [role='tree']");
+  if ((mod && !e.altKey && e.key === "/" && !target?.closest(".cm-editor")) || (e.key === "?" && !mod && !e.altKey && !typing)) {
     e.preventDefault();
     e.stopPropagation();
     ui.openModal("shortcuts");

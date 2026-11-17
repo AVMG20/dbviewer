@@ -498,7 +498,8 @@ function openColumn(r: Row, structure = false, preview = true, focus = false) {
   if (r.kind !== "col" || !r.table || !r.name) return;
   if (structure) tabs.openStructure(r.connId, r.schema ?? "", r.table, { focus });
   else tabs.openTable(r.connId, r.schema ?? "", r.table, { preview, focus });
-  ui.focusColumn(r.connId, r.schema ?? "", r.table, r.name);
+  // only a table view consumes the request: left pending, the next data view of the table would replay it
+  if (!structure) ui.focusColumn(r.connId, r.schema ?? "", r.table, r.name);
 }
 function activate(r: Row, alt = false, viaKey = false) {
   switch (r.kind) {
@@ -728,7 +729,7 @@ async function reveal(connId: string, schema?: string, table?: string, focus = t
 }
 watch(
   () => ui.revealRequest,
-  (r) => r && void reveal(r.connId, r.schema, r.table, true, r.column),
+  (r) => r && void reveal(r.connId, r.schema, r.table, r.focus !== false, r.column),
 );
 // Follow the active tab: expand its connection / schema / group, select + scroll, no focus steal.
 watch(

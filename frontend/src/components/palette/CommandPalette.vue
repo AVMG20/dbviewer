@@ -105,7 +105,8 @@ function connRight(connId: string) {
 function openTableItem(connId: string, schema: string, table: string, alt: boolean, column?: string) {
   if (alt) tabs.openStructure(connId, schema, table, { focus: true });
   else tabs.openTable(connId, schema, table, { preview: true, focus: true });
-  ui.revealInSidebar(connId, schema, table, column || undefined);
+  // no focus: keyboard focus belongs to the opened view (an async reveal would steal it)
+  ui.revealInSidebar(connId, schema, table, column || undefined, false);
   if (column && !alt) ui.focusColumn(connId, schema, table, column);
 }
 
@@ -291,7 +292,8 @@ function run(i = idx.value, alt = false) {
   close();
   nextTick(() => {
     it.run(alt);
-    if (!it.noFocus) setTimeout(() => ui.focusActiveView(), 80);
+    // a column hit focuses the grid on that column itself (TableView); the view's default focus would take it away
+    if (!it.noFocus && !(it.kind === "column" && !alt)) setTimeout(() => ui.focusActiveView(), 80);
   });
 }
 onBeforeUnmount(() => {
