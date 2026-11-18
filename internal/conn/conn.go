@@ -192,10 +192,16 @@ func (m *Manager) Connect(ctx context.Context, id string, password string) (mode
 	m.emit(model.ConnectionStatus{ConnID: id, Connecting: true, ReadOnly: cfg.ReadOnly})
 	p, err := m.openWith(ctx, cfg, pw, true)
 	if err != nil {
-		if cfg.PasswordMode == model.PasswordSave && !cfg.HasPassword && password == "" && cfg.Driver != model.DriverSQLite && isAuthFailure(err) {
-			// "save" mode without a saved password and the server wants one:
-			// ask for it (the UI prompts and calls Connect(id, password))
-			err = model.Errf(model.ErrPasswordNeeded, "the password of %q is not saved; enter it (it will be saved for next time)", cfg.Name)
+		if password == "" && cfg.Driver != model.DriverSQLite && isAuthFailure(err) {
+			switch {
+			case cfg.PasswordMode == model.PasswordSave && !cfg.HasPassword:
+				// "save" mode without a saved password and the server wants one:
+				// ask for it (the UI prompts and calls Connect(id, password))
+				err = model.Errf(model.ErrPasswordNeeded, "the password of %q is not saved; enter it (it will be saved for next time)", cfg.Name)
+			case cfg.PasswordMode == model.PasswordAsk:
+				// "ask" mode tried without a password first: the server wants one
+				err = model.Errf(model.ErrPasswordNeeded, "connection %q needs a password", cfg.Name)
+			}
 		}
 		return m.fail(cfg, err)
 	}

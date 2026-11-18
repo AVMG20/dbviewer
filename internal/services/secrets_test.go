@@ -97,3 +97,18 @@ func TestSecretsFileOnly(t *testing.T) {
 		}
 	}
 }
+
+// An "ask" connection tried without a password (the UI does so for local
+// databases) reports password_required when the server wants one.
+func TestAskModeEmptyPassword(t *testing.T) {
+	f := newFixture(t)
+	c := f.save(model.ConnectionConfig{Name: "pg-ask", Driver: model.DriverPostgres, Host: "127.0.0.1", Port: 55432, User: "postgres",
+		PasswordMode: model.PasswordAsk, Database: "dbviewer_dummy", SSLMode: model.SSLDisable})
+	if _, err := f.cs.Connect(f.ctx, c.ID, ""); err == nil || !strings.HasPrefix(err.Error(), model.ErrPasswordNeeded) {
+		t.Fatalf("expected password_required, got %v", err)
+	}
+	if _, err := f.cs.Connect(f.ctx, c.ID, "dbviewer"); err != nil {
+		t.Fatalf("connect with entered password: %v", err)
+	}
+	f.cs.Disconnect(c.ID)
+}

@@ -21,6 +21,15 @@ import { friendlyError } from "@/components/common/errors";
 import { useUiStore } from "./ui";
 
 const ACTIVE_PROJECT_KEY = "ui:activeProject";
+/** Ids of "ask" connections that connected with an empty password (tried without asking next time). */
+const NO_PASSWORD_KEY = "ui:noPassword";
+
+/** A local database without SSH (socket or loopback host): worth a try without a password. */
+function isLocal(c: ConnectionConfig): boolean {
+  if (c.ssh.enabled) return false;
+  if (c.socket) return true;
+  return ["", "localhost", "127.0.0.1", "::1"].includes(c.host.trim().toLowerCase());
+}
 
 export const useProjectsStore = defineStore("projects", () => {
   const projects = ref<Project[]>([]);
@@ -116,12 +125,18 @@ export const useProjectsStore = defineStore("projects", () => {
       });
     }
     try {
-      const [ps, cs, st, saved] = await Promise.all([
+      const [ps, cs, st, saved, noPw] = await Promise.all([
         projectApi.Projects(),
         connectionApi.Connections(""),
         connectionApi.ConnectionStatuses(),
         projectApi.GetUIState(ACTIVE_PROJECT_KEY),
+        projectApi.GetUIState(NO_PASSWORD_KEY).catch(() => ""),
       ]);
+      try {
+        noPassword = new Set(JSON.parse(noPw || "[]"));
+      } catch {
+        noPassword = new Set();
+      }
       projects.value = ps;
       connections.value = cs;
       statuses.value = Object.fromEntries(st.map((s) => [s.connId, s]));
@@ -198,10 +213,17 @@ export const useProjectsStore = defineStore("projects", () => {
 
   /**
    * Makes sure the connection is open: connects (asking for the password when the
-   * connection uses passwordMode "ask"). Resolves false when it failed or the user
+   * connection uses passwordMode "ask", unless it connects without one). Resolves false when it failed or the user
    * cancelled; failures are toasted.
    */
   const connecting = new Map<string, Promise<boolean>>();
+  let noPassword = new Set<string>();
+  function markNoPassword(id: string, on: boolean) {
+    if (noPassword.has(id) === on) return;
+    if (on) noPassword.add(id);
+    else noPassword.delete(id);
+    projectApi.SetUIState(NO_PASSWORD_KEY, JSON.stringify([...noPassword])).catch(() => {});
+  }
   async function ensureConnected(id: string): Promise<boolean> {
     if (isConnected(id)) return true;
     const existing = connecting.get(id);
@@ -217,12 +239,25 @@ export const useProjectsStore = defineStore("projects", () => {
     try {
       let pw = "";
       if (cfg.passwordMode === "ask") {
+        // a local database, or one that worked without a password before: try
+        // without asking; the backend answers password_required if it wants one
+        if (cfg.driver !== "sqlite" && (isLocal(cfg) || noPassword.has(id))) {
+          try {
+            await withHostKeyTrust(() => connect(id, ""));
+            markNoPassword(id, true);
+            return true;
+          } catch (e) {
+            if (apiError(e).code !== "password_required") throw e;
+            markNoPassword(id, false);
+          }
+        }
         const entered = await ui.askPassword(id);
         if (entered === null) return false;
         pw = entered;
       }
       try {
         await withHostKeyTrust(() => connect(id, pw));
+        if (cfg.passwordMode === "ask") markNoPassword(id, pw === "");
       } catch (e) {
         // "save" mode but no saved password (e.g. it used to be in the Keychain):
         // ask; the backend saves it once the connect succeeds

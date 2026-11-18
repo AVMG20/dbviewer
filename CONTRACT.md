@@ -81,7 +81,11 @@ Conventions:
   `""` = the connection's default schema (`ConnectionStatus.defaultSchema`).
 - Connections with `passwordMode: "save"` connect lazily on first use; you do not
   need to call `Connect` first. `passwordMode: "ask"` connections reject with
-  `password_required` until `Connect(id, password)` succeeded.
+  `password_required` until `Connect(id, password)` succeeded. `Connect(id, "")` on an
+  "ask" connection whose server rejects the empty password also rejects with
+  `password_required`; the UI tries that first (no prompt) for local databases (socket or
+  loopback host, no SSH) and for connections that connected without a password before
+  (UI state key `ui:noPassword`), and only prompts when it fails.
 
 ### Errors
 
