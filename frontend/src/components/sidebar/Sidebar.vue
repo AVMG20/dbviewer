@@ -168,7 +168,7 @@ async function refreshSchema(id: string, s: string) {
 // A filter over what the tree shows (PhpStorm style): table / view names and column names of
 // expanded schemas match, nothing gets connected or expanded by it. Tables matching only
 // through columns list those columns (best COL_CAP, then "N more") so Enter can open the exact
-// column. It stays on while tables are opened from it; Esc clears it. Cmd+K searches everything.
+// column. It stays on while tables are opened from it by click; Enter and Esc clear it. Cmd+K searches everything.
 const speed = ref("");
 const searching = computed(() => speed.value.length > 0);
 /** matched-column rows shown per table before a "N more" row */
@@ -538,6 +538,13 @@ function activate(r: Row, alt = false, viaKey = false) {
       break;
   }
 }
+/** Enter: opening a table / column from the search ends the search and shows the row in the full tree. */
+function activateByKey(r: Row, alt: boolean) {
+  activate(r, alt, true);
+  if (!searching.value || (r.kind !== "table" && r.kind !== "col")) return;
+  clearSpeed();
+  void reveal(r.connId, r.schema, r.kind === "table" ? r.name : r.table, false, r.kind === "col" ? r.name : undefined);
+}
 function clearSpeed(keepSel = false) {
   const sel = selected.value;
   speed.value = "";
@@ -608,7 +615,7 @@ function onKeydown(e: KeyboardEvent) {
       const r = selRow();
       if (r) {
         e.preventDefault();
-        activate(r, true, true);
+        activateByKey(r, true);
       }
     } else if ((e.key === "Backspace" && mod) || (e.ctrlKey && e.key === "u")) {
       if (searching.value) {
@@ -632,7 +639,7 @@ function onKeydown(e: KeyboardEvent) {
     case "Enter":
       if (r) {
         e.preventDefault();
-        activate(r, e.shiftKey, true);
+        activateByKey(r, e.shiftKey);
       }
       return;
     case "Escape":
