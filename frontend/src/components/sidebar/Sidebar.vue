@@ -175,7 +175,12 @@ const searching = computed(() => speed.value.length > 0);
 const COL_CAP = 3;
 /** tables whose "N more" row was activated (reset with every query change) */
 const showAllCols = reactive(new Set<string>());
-watch(speed, () => showAllCols.clear());
+/** Cmd+A in the search: the whole query is selected, the next key replaces / deletes it */
+const speedAll = ref(false);
+watch(speed, () => {
+  showAllCols.clear();
+  speedAll.value = false;
+});
 
 // Column search needs the schema index (one bulk query per schema, cached by the backend):
 // fetch it for every expanded schema as soon as a search starts.
@@ -592,8 +597,14 @@ function canCollapse(r: Row) {
 
 function onKeydown(e: KeyboardEvent) {
   const mod = isMod(e);
+  if (searching.value && speedAll.value && !onSpeedAllKey(e, mod)) return;
   if (e.metaKey || e.ctrlKey || e.altKey) {
-    if (mod && e.key === "Enter") {
+    if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "a") {
+      if (searching.value) {
+        e.preventDefault();
+        speedAll.value = true;
+      }
+    } else if (mod && e.key === "Enter") {
       const r = selRow();
       if (r) {
         e.preventDefault();
@@ -683,12 +694,42 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
+/** A key while the whole query is selected; returns true to continue with the normal handling. */
+function onSpeedAllKey(e: KeyboardEvent, mod: boolean): boolean {
+  if (["Meta", "Control", "Alt", "Shift"].includes(e.key)) return false;
+  const k = e.key.toLowerCase();
+  if (mod && !e.altKey && (k === "a" || k === "c" || k === "x")) {
+    e.preventDefault();
+    if (k !== "a") void navigator.clipboard?.writeText(speed.value).catch(() => {});
+    if (k === "x") speed.value = "";
+    return false;
+  }
+  if (e.key === "Backspace" || e.key === "Delete") {
+    e.preventDefault();
+    speed.value = "";
+    return false;
+  }
+  if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    speed.value = e.key;
+    return false;
+  }
+  if (!mod || k !== "v") speedAll.value = false; // paste replaces (onPaste); anything else deselects
+  return true;
+}
+
 function onPaste(e: ClipboardEvent) {
   const t = e.clipboardData?.getData("text")?.trim();
   if (t && !t.includes("\n")) {
     e.preventDefault();
-    speed.value += t;
+    speed.value = speedAll.value ? t : speed.value + t;
   }
+}
+/** Clicking the search box keeps the tree focused; a double click selects the query. */
+function onSpeedMouse(e: MouseEvent) {
+  e.preventDefault();
+  scroller.value?.focus({ preventScroll: true });
+  speedAll.value = e.detail >= 2;
 }
 
 // ---- reveal / focus ---------------------------------------------------------------
@@ -1326,9 +1367,9 @@ function rowTitle(r: Row): string | undefined {
     </div>
 
     <!-- speed search overlay -->
-    <div v-if="searching" class="speed">
+    <div v-if="searching" class="speed" @mousedown="onSpeedMouse">
       <Icon name="search" class="text-ac" />
-      <span class="speed-text mono">{{ speed }}</span>
+      <span class="speed-text mono" :class="{ all: speedAll }"><span>{{ speed }}</span></span>
       <span class="dim whitespace-nowrap">{{ matchText }}</span>
       <kbd class="cursor-pointer" title="Clear filter" @click="clearSpeed(true)">esc</kbd>
     </div>
@@ -1400,6 +1441,8 @@ function rowTitle(r: Row): string | undefined {
   content: ""; display: inline-block; width: 1px; height: 12px; background: var(--tx);
   vertical-align: -2px; margin-left: 1px; animation: blink 1s steps(1) infinite;
 }
+.speed-text.all > span { background: color-mix(in srgb, var(--ac) 35%, transparent); border-radius: 2px; }
+.speed-text.all::after { display: none; }
 @keyframes blink { 50% { opacity: 0; } }
 .resize { position: absolute; top: 0; right: -3px; bottom: 0; width: 6px; cursor: col-resize; z-index: 6; }
 .resize:hover { background: color-mix(in srgb, var(--ac) 40%, transparent); }
