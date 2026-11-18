@@ -263,7 +263,7 @@ export const useProjectsStore = defineStore("projects", () => {
 
   /** Persists a new connection order within a project. */
   async function reorderConnections(projectId: string, ids: string[]) {
-    await connectionApi.ReorderConnections(projectId, ids);
+    const before = connections.value.map((c) => [c, c.sortOrder, c.projectId] as const);
     ids.forEach((id, i) => {
       const c = getConnection(id);
       if (c) {
@@ -271,6 +271,15 @@ export const useProjectsStore = defineStore("projects", () => {
         c.projectId = projectId;
       }
     });
+    try {
+      await connectionApi.ReorderConnections(projectId, ids);
+    } catch (e) {
+      for (const [c, so, pid] of before) {
+        c.sortOrder = so;
+        c.projectId = pid;
+      }
+      throw e;
+    }
   }
 
   function testConnection(cfg: ConnectionConfig): Promise<TestResult> {

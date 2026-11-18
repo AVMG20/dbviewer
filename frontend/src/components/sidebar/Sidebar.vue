@@ -1100,6 +1100,68 @@ function startResize(e: MouseEvent) {
   window.addEventListener("mouseup", up);
 }
 
+// ---- drag reorder (connections) -------------------------------------------------------
+// A connection is dragged by its row; any row of another connection is a drop target:
+// the upper half of its connection row drops before it, everything below drops after it.
+const dragConn = ref("");
+const dropAt = ref<{ connId: string; after: boolean } | null>(null);
+function onDragStart(e: DragEvent, r: Row) {
+  if (r.kind !== "conn") {
+    e.preventDefault();
+    return;
+  }
+  dragConn.value = r.connId;
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", r.name ?? "");
+  }
+}
+function onDragOver(e: DragEvent, r: Row) {
+  if (!dragConn.value) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  let after = true;
+  if (r.kind === "conn") {
+    const b = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    after = e.clientY > b.top + b.height / 2;
+  }
+  const cur = dropAt.value;
+  if (!cur || cur.connId !== r.connId || cur.after !== after) dropAt.value = { connId: r.connId, after };
+}
+async function onDrop(e: DragEvent) {
+  e.preventDefault();
+  const src = dragConn.value;
+  const at = dropAt.value;
+  onDragEnd();
+  if (!src || !at || at.connId === src) return;
+  const ids = projects.projectConnections.map((c) => c.id).filter((id) => id !== src);
+  const i = ids.indexOf(at.connId);
+  if (i < 0) return;
+  ids.splice(at.after ? i + 1 : i, 0, src);
+  if (ids.every((id, j) => projects.projectConnections[j]?.id === id)) return;
+  try {
+    await projects.reorderConnections(projects.activeProjectId, ids);
+  } catch (err) {
+    ui.toast(apiError(err).message, "error");
+  }
+}
+function onDragEnd() {
+  dragConn.value = "";
+  dropAt.value = null;
+}
+/** Drop indicator: a line above the target connection row, or below its last row. */
+const lastRowOf = computed(() => {
+  const m: Record<string, string> = {};
+  for (const r of rows.value) m[r.connId] = r.key;
+  return m;
+});
+function dropClass(r: Row): string | undefined {
+  const at = dropAt.value;
+  if (!at || at.connId !== r.connId || at.connId === dragConn.value) return undefined;
+  if (!at.after) return r.kind === "conn" ? "drop-before" : undefined;
+  return lastRowOf.value[r.connId] === r.key ? "drop-after" : undefined;
+}
+
 // ---- row helpers ----------------------------------------------------------------------
 /** Shortens the longest unmatched run (middle ellipsis) until the segments fit `max` chars; matched text is never cut. */
 function fitSegs(segs: Seg[], max: number): Seg[] {
@@ -1269,12 +1331,13 @@ function rowTitle(r: Row): string | undefined {
         >
           <div
             class="tree-row flex h-full items-center gap-1.5 whitespace-nowrap pr-2"
-            :class="{
+            :class="[{
               sel: selected === it.row.key,
               foc: focused,
               act: isActiveTable(it.row),
               msg: it.row.kind === 'msg',
-            }"
+              dragging: it.row.kind === 'conn' && dragConn === it.row.connId,
+            }, it.stuck ? undefined : dropClass(it.row)]"
             :style="{
               paddingLeft: 8 + it.row.level * 14 + 'px',
               '--conn': it.row.kind === 'conn' ? projects.connColor(it.row.connId) : undefined,
@@ -1287,6 +1350,11 @@ function rowTitle(r: Row): string | undefined {
             @click="it.stuck ? onStickyClick(it.row) : onRowClick(it.row)"
             @dblclick="onRowDblClick(it.row)"
             @contextmenu="onContext($event, it.row)"
+            :draggable="it.row.kind === 'conn'"
+            @dragstart="onDragStart($event, it.row)"
+            @dragover="onDragOver($event, it.row)"
+            @drop="onDrop"
+            @dragend="onDragEnd"
           >
             <!-- chevron -->
             <span
@@ -1424,6 +1492,9 @@ function rowTitle(r: Row): string | undefined {
 .tree-row.act :deep(svg) { color: var(--ac); }
 .tree-row.act .mono { color: var(--tx); }
 .tree-row.msg:hover { background: none; }
+.tree-row.dragging { opacity: .5; }
+.tree-row.drop-before { box-shadow: inset 0 2px 0 var(--ac); border-radius: 0; }
+.tree-row.drop-after { box-shadow: inset 0 -2px 0 var(--ac); border-radius: 0; }
 .chev { display: inline-flex; flex: none; color: var(--dim); transition: transform .1s; }
 .chev.open { transform: rotate(90deg); }
 .cnt { margin-left: auto; color: var(--dim); font: 10px var(--mono); }
