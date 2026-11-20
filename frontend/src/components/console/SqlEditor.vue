@@ -6,10 +6,12 @@ import { Compartment, EditorState, Prec } from "@codemirror/state";
 import { EditorView, drawSelection, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers, placeholder } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab, isolateHistory } from "@codemirror/commands";
 import { HighlightStyle, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
-import { acceptCompletion, autocompletion, closeBrackets, closeCompletion, closeBracketsKeymap, completionKeymap, type Completion, type CompletionContext } from "@codemirror/autocomplete";
+import { acceptCompletion, autocompletion, closeBrackets, closeCompletion, closeBracketsKeymap, completionKeymap, completionStatus, type Completion, type CompletionContext } from "@codemirror/autocomplete";
 import { MariaSQL, MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { appHighlight, appTheme } from "./cmTheme";
+import { getInline, inlineEdit } from "./aiInline";
+import { acceptGhost, acceptGhostWord, aiGhost, aiRowPicked, ghostListNav, ghostOwnsTab, hideGhost, type GhostOptions } from "./aiGhost";
 
 export interface SchemaTable { name: string; columns: string[]; kind?: string }
 
@@ -20,6 +22,8 @@ const props = defineProps<{
   readOnly?: boolean;
   lineNumbers?: boolean;
   placeholderText?: string;
+  /** inline AI suggestions (ghost text); only the SQL console passes it */
+  ghost?: GhostOptions;
 }>();
 const emit = defineEmits<{
   "update:modelValue": [v: string];
@@ -27,6 +31,10 @@ const emit = defineEmits<{
   "run-all": [];
   "save-query": [];
   format: [];
+  /** ⌘\ (AI prompt) */
+  ai: [];
+  /** Esc in the editor while an inline AI session is open */
+  "ai-escape": [];
 }>();
 
 const host = ref<HTMLElement | null>(null);
@@ -110,16 +118,37 @@ onMounted(() => {
       extensions: [
         Prec.highest(
           keymap.of([
-            // Tab accepts an open completion; otherwise falls through to indentWithTab
-            { key: "Tab", run: acceptCompletion },
+            // With the completion list open, the AI suggestion is its first row (selected by default):
+            // Tab / Enter accept the highlighted row, ↓/↑ move between the AI row and the native items.
+            // Tab without a list accepts the suggestion; otherwise falls through to indentWithTab.
+            { key: "Tab", run: (v) => (ghostOwnsTab(v.state) ? acceptGhost(v) : acceptCompletion(v)) },
+            { key: "Enter", run: (v) => (aiRowPicked(v.state) ? acceptGhost(v) : false) },
+            { key: "ArrowDown", run: ghostListNav("down") },
+            { key: "ArrowUp", run: ghostListNav("up") },
+            { key: "PageDown", run: ghostListNav("pagedown") },
+            { key: "PageUp", run: ghostListNav("pageup") },
+            { key: "Alt-ArrowRight", run: acceptGhostWord },
             // running closes an open completion list (it would float over a confirmation dialog)
             { key: "Mod-Enter", run: (v) => (closeCompletion(v), emit("run"), true) },
             { key: "Mod-Shift-Enter", run: (v) => (closeCompletion(v), emit("run-all"), true) },
             { key: "Mod-s", run: () => (emit("save-query"), true) },
             { key: "Alt-Shift-f", run: () => (emit("format"), true) },
+            { key: "Mod-\\", run: (v) => (closeCompletion(v), hideGhost(v), emit("ai"), true) },
+            // Esc: the completion list first (completion keymap), then the AI suggestion, then an inline AI session
+            {
+              key: "Escape",
+              run: (v) => {
+                if (completionStatus(v.state) !== null) return false;
+                if (hideGhost(v)) return true;
+                if (getInline(v)) return emit("ai-escape"), true;
+                return false;
+              },
+            },
           ]),
         ),
         props.lineNumbers === false ? [] : [lineNumbers(), highlightActiveLineGutter()],
+        inlineEdit(),
+        props.ghost ? aiGhost(props.ghost) : [],
         history(),
         drawSelection(),
         indentOnInput(),
@@ -151,6 +180,8 @@ watch(() => props.driver, () => view?.dispatch({ effects: langConf.reconfigure(l
 
 defineExpose({
   focus: () => view?.focus(),
+  /** The CodeMirror view (inline AI sessions, see aiInline.ts). */
+  getView: () => view,
   /** Current selection (text may be empty) and cursor offset. */
   getState: () => {
     const s = view!.state;

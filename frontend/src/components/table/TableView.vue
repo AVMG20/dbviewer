@@ -2,6 +2,8 @@
 // Table data tab (data agent): toolbar (refresh, paging, WHERE, ORDER BY, quick find, column
 // filters, add/duplicate/delete row, revert, Save, Copy as, Export, record panel) + DataGrid.
 // Nothing is written until Save: edits go to stores/changes and are previewed first.
+// AI filter (⌘\ or ✨ next to WHERE, when AI is on): a plain-language request becomes a WHERE (and an
+// ORDER BY when it asks for a sort) in the inputs; ↵ applies it as usual, Esc in WHERE reverts it.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { kbd } from "@/lib/kbd";
 import type { CancellablePromise } from "@wailsio/runtime";
@@ -29,6 +31,8 @@ import RecordPanel from "./RecordPanel.vue";
 import NavMenu from "./NavMenu.vue";
 import { incomingForRow, loadLinks, navEntries, navigableColumns, type Links, type NavEntry } from "@/lib/fkNav";
 import SqlClauseInput from "./SqlClauseInput.vue";
+import { aiError, aiOffMessage, aiReady, filterTask, fmtDuration, release as releaseAi, warm as warmAi, type AiJob } from "@/lib/ai";
+import type { AIFilterResult } from "@/api";
 
 const props = defineProps<{ tab: Tab; active: boolean }>();
 
@@ -293,6 +297,7 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   unmounted = true;
+  aiFilterJob?.cancel();
   window.removeEventListener("keydown", onWinKey);
   inflight?.cancel();
   countReq?.cancel();
@@ -319,8 +324,91 @@ watch(() => projects.statuses[connId.value]?.connected, (c, prev) => {
   if (c && !prev && loadError.value) load();
 });
 
+// ---- AI filter (plain language -> WHERE / ORDER BY) ---------------------------------------
+const whereInput = ref<InstanceType<typeof SqlClauseInput> | null>(null);
+const aiFilterInput = ref<HTMLInputElement | null>(null);
+const aiAvailable = computed(() => settings.aiEnabled && !!settings.aiModel);
+const aiFilter = ref<{ open: boolean; text: string; busy: boolean; error: string; settings: boolean }>({ open: false, text: "", busy: false, error: "", settings: false });
+/** an AI suggestion is in the inputs (not applied yet): Esc in WHERE restores these */
+const aiSuggested = ref<{ where: string; orderBy: string; info: string } | null>(null);
+let aiFilterJob: AiJob<AIFilterResult> | null = null;
+
+async function openAiFilter() {
+  if (!aiReady()) return void ui.toast(aiOffMessage(), "info", 4000);
+  aiFilter.value.open = true;
+  aiFilter.value.error = "";
+  await nextTick();
+  aiFilterInput.value?.focus();
+  aiFilterInput.value?.select();
+  void warmAi();
+}
+function closeAiFilter(focusWhere = true) {
+  aiFilterJob?.cancel();
+  aiFilterJob = null;
+  if (!aiFilter.value.open) return;
+  aiFilter.value.open = false;
+  aiFilter.value.busy = false;
+  releaseAi();
+  if (focusWhere) nextTick(() => whereInput.value?.focus());
+}
+async function runAiFilter() {
+  const prompt = aiFilter.value.text.trim();
+  if (!prompt || aiFilter.value.busy) return;
+  aiFilter.value.busy = true;
+  aiFilter.value.error = "";
+  const my = (aiFilterJob = filterTask({ connId: connId.value, schema: schema.value, table: table.value, prompt }, { session: true }));
+  try {
+    const res = await my.promise;
+    if (aiFilterJob !== my) return;
+    const prev = aiSuggested.value ?? { where: whereDraft.value, orderBy: orderDraft.value };
+    whereDraft.value = res.where;
+    if (res.orderBy) orderDraft.value = res.orderBy;
+    const vals = Object.keys(res.values);
+    aiSuggested.value = {
+      where: prev.where, orderBy: prev.orderBy,
+      info: `${res.model} · ${fmtDuration(res.durationMs)}${vals.length ? ` · used the values of ${vals.join(", ")}` : ""}`,
+    };
+    aiFilter.value.busy = false;
+    closeAiFilter();
+  } catch (e) {
+    if (aiFilterJob !== my) return;
+    const err = aiError(e);
+    aiFilter.value.busy = false;
+    if (err) {
+      aiFilter.value.error = err.message;
+      aiFilter.value.settings = err.settings;
+    }
+  } finally {
+    if (aiFilterJob === my) aiFilterJob = null;
+  }
+}
+function onAiFilterKey(e: KeyboardEvent) {
+  e.stopPropagation();
+  if (e.isComposing) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    void runAiFilter();
+  } else if (e.key === "Escape" || (isMod(e) && e.code === "Backslash")) {
+    e.preventDefault();
+    if (aiFilter.value.busy) {
+      aiFilterJob?.cancel();
+      aiFilterJob = null;
+      aiFilter.value.busy = false;
+    } else closeAiFilter();
+  }
+}
+/** Esc in WHERE: undo the AI suggestion that was not applied yet */
+function revertAiSuggestion() {
+  const s = aiSuggested.value;
+  if (!s) return;
+  whereDraft.value = s.where;
+  orderDraft.value = s.orderBy;
+  aiSuggested.value = null;
+}
+
 // ---- where / order by / sort ------------------------------------------------------------
 function applyClauses() {
+  aiSuggested.value = null;
   promote();
   applied.value = { where: whereDraft.value.trim(), orderBy: orderDraft.value.trim() };
   syncSortsFromOrder();
@@ -758,6 +846,8 @@ const overlayOpen = computed(() => ui.overlayOpen);
 function onWinKey(e: KeyboardEvent) {
   if (!props.active || overlayOpen.value) return;
   const mod = isMod(e);
+  // ⌘\ AI filter (inside WHERE / ORDER BY the input's keymap handles it)
+  if (mod && !e.altKey && e.code === "Backslash" && !e.defaultPrevented) return stop(e), void openAiFilter();
   const t = e.target as HTMLElement | null;
   const inField = !!t?.closest("input,textarea,select,[contenteditable='true'],.cm-editor");
   const k = e.key.toLowerCase();
@@ -1029,9 +1119,43 @@ function onAltClick(row: number, col: number) {
     </div>
     <!-- toolbar row 2 -->
     <div class="tb">
-      <SqlClauseInput v-model="whereDraft" label="WHERE" :driver="driver" placeholder="e.g. status = 'new'" :columns="colNames" :error="whereError" @apply="applyClauses" />
-      <SqlClauseInput v-model="orderDraft" label="ORDER BY" :driver="driver" placeholder="e.g. id DESC" :columns="colNames" @apply="applyClauses" />
-      <button class="btn" title="Apply WHERE / ORDER BY (↵)" @click="applyClauses">Apply</button>
+      <template v-if="aiFilter.open">
+        <div class="aif" :class="{ busy: aiFilter.busy }">
+          <span class="spark"><Icon name="sparkle" :size="12" /></span>
+          <input
+            ref="aiFilterInput" v-model="aiFilter.text" class="aif-in" spellcheck="false" autocomplete="off"
+            :placeholder="`Describe the rows of ${table}, e.g. orders last week over 100 euro, not cancelled`"
+            aria-label="Describe the rows to show" :readonly="aiFilter.busy" @keydown="onAiFilterKey"
+          />
+          <span v-if="aiFilter.busy" class="dim aif-st"><span class="dots"><i></i><i></i><i></i></span> Writing the filter… <kbd>Esc</kbd></span>
+          <span v-else class="dim aif-st"><kbd>↵</kbd> write WHERE · <kbd>Esc</kbd> close</span>
+        </div>
+        <button class="btn ghost" title="Close (Esc)" @click="closeAiFilter()"><Icon name="x" /></button>
+      </template>
+      <template v-else>
+        <SqlClauseInput
+          ref="whereInput" v-model="whereDraft" label="WHERE" :driver="driver" placeholder="e.g. status = 'new'" :columns="colNames" :error="whereError"
+          @apply="applyClauses" @escape="revertAiSuggestion" @ai="openAiFilter"
+        />
+        <button
+          v-if="aiAvailable" class="btn ghost aib" :title="kbd(`Filter in plain language with ${settings.aiModel} (⌘\\)`)" aria-label="Filter with AI"
+          @click="openAiFilter"
+        ><Icon name="sparkle" /></button>
+        <SqlClauseInput v-model="orderDraft" label="ORDER BY" :driver="driver" placeholder="e.g. id DESC" :columns="colNames" @apply="applyClauses" @escape="revertAiSuggestion" @ai="openAiFilter" />
+        <button class="btn" title="Apply WHERE / ORDER BY (↵)" @click="applyClauses">Apply</button>
+      </template>
+    </div>
+    <div v-if="aiFilter.open && aiFilter.error" class="errbar selectable">
+      {{ aiFilter.error }}
+      <button v-if="aiFilter.settings" class="btn ghost lnk" @click="ui.openModal('settings')">Open Settings</button>
+    </div>
+    <div v-else-if="aiSuggested && !aiFilter.open" class="aibar">
+      <Icon name="sparkle" :size="11" class="spark" />
+      <span>AI filter: <kbd>↵</kbd> in WHERE applies it, <kbd>Esc</kbd> reverts</span>
+      <span class="dim">· {{ aiSuggested.info }}</span>
+      <span class="flex-1"></span>
+      <button class="btn ghost sm" @click="applyClauses">Apply</button>
+      <button class="btn ghost sm" @click="revertAiSuggestion">Revert</button>
     </div>
     <div v-if="whereError" class="errbar mono selectable">{{ whereError }}</div>
     <!-- filter chips -->
@@ -1144,6 +1268,23 @@ function onAltClick(row: number, col: number) {
 .chip-x { background: none; border: 0; padding: 2px; border-radius: 50%; display: inline-flex; color: var(--dim); }
 .chip-x:hover { background: var(--hov); color: var(--tx); }
 .find { background: var(--bg2); }
+.aib { padding: 0 4px; margin-left: -4px; }
+.aib :deep(svg), .spark { color: var(--ac); }
+.aif { flex: 1 1 auto; display: flex; align-items: center; gap: 6px; height: 22px; min-width: 200px; padding: 0 6px; border: 1px solid var(--ac); border-radius: 4px; background: var(--bg); }
+.aif.busy .spark { animation: pulse 1.2s ease-in-out infinite; }
+.aif-in { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; color: var(--tx); font: inherit; font-size: 12px; }
+.aif-in::placeholder { color: var(--dim); opacity: .8; }
+.aif-st { font-size: 11px; white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+.aif-st kbd, .aibar kbd { font-size: 9px; }
+.aibar { display: flex; align-items: center; gap: 6px; padding: 3px 10px; font-size: 11px; background: color-mix(in srgb, var(--ac) 8%, var(--bg2)); border-bottom: 1px solid var(--bd); }
+.aibar .btn.sm { height: 20px; padding: 0 8px; font-size: 11px; }
+.lnk { color: var(--ac); font-size: 11px; }
+.dots { display: inline-flex; gap: 3px; }
+.dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--ac); animation: blink 1s infinite ease-in-out; }
+.dots i:nth-child(2) { animation-delay: .15s; }
+.dots i:nth-child(3) { animation-delay: .3s; }
+@keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 .loaderr { padding: 24px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; color: var(--danger); }
 .loaderr .mono { color: var(--tx); white-space: pre-wrap; }
 </style>

@@ -6,7 +6,7 @@ import { isMac } from "@/components/common/keys";
 const KEY_NAMES: Record<string, string> = { "↵": "Enter", "⌫": "Backspace", "⎋": "Esc", "⇥": "Tab" };
 
 /** One shortcut chord or glyph run: modifiers, then an optional key or "-click". */
-const CHORD = /[⌘⇧⌥⌃]+(?:-click|[↵⌫⎋⇥]|[A-Za-z0-9.,/[\]=+-](?![A-Za-z]))?/g;
+const CHORD = /[⌘⇧⌥⌃]+(?:-click|[↵⌫⎋⇥]|[A-Za-z0-9.,/\\[\]=+-](?![A-Za-z]))?/g;
 
 function convertChord(chord: string): string {
   const click = chord.endsWith("-click");

@@ -31,6 +31,8 @@
 
   --chg-edit: #e3a73a44;
   --mark: #e3a73a77;    /* quick-find highlight */
+  --ai: #c084fc;        /* AI suggestions (autocomplete AI row) */
+  --ai-bg: #c084fc3d;   /* selected AI row fill */
 
   /* semantic */
   --danger: #f85149;
@@ -73,6 +75,8 @@
 
   --chg-edit: #bf870055;
   --mark: #bf870066;
+  --ai: #9333ea;
+  --ai-bg: #9333ea1c;
 
   --danger: #cf222e;
   --warn: #9a6700;

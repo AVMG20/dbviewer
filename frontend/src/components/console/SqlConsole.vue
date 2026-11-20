@@ -7,7 +7,14 @@
 // Before running on a writable connection: UPDATE/DELETE without WHERE and (on red connections) any
 // writing statement ask for one combined confirmation (classification: queryApi.SplitStatements).
 // After a run the tab is named after the first referenced table unless the user renamed it.
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+// AI (when enabled in Settings; the AI button's menu lists everything): ⌘\ opens an inline prompt
+// above the statement at the cursor / the selection that writes or changes SQL (AiPrompt.vue,
+// aiInline.ts). Fix with AI (⌥⌘F, "Query failed" panel) and Convert to … stream a rewrite over the
+// statement the same way. Explain with AI (⌥⌘E) and "What's slow?" (EXPLAIN results) answer in the
+// side panel (AiAnswer.vue). Save (⌘S) suggests a name; after a run the tab gets a short AI title
+// unless the user renamed it.
+import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import type { EditorView } from "@codemirror/view";
 import { kbd } from "@/lib/kbd";
 import {
   apiError, dataApi, isBinary, isLongText, newId, projectApi, queryApi, runQuery,
@@ -27,6 +34,14 @@ import { COPY_FORMATS, formatCopy } from "@/lib/copyFormats";
 import { fmtNum } from "@/lib/format";
 import type { GridRow, MenuItem } from "@/lib/gridTypes";
 import SqlEditor, { type SchemaTable } from "./SqlEditor.vue";
+import AiPrompt, { type AiMode, type AiTarget, type AiTask } from "./AiPrompt.vue";
+import AiAnswer, { type AiAnswerRequest } from "./AiAnswer.vue";
+import { discardInline, endInline, getInline, retargetInline, startInline } from "./aiInline";
+import { aiError, aiInlineReady, aiOffMessage, aiReady, completeSql, inlineModel, release as releaseAi, sqlTask, textTask, warmInline, type AiJob } from "@/lib/ai";
+import type { GhostOptions } from "./aiGhost";
+import { cellText } from "@/lib/format";
+import type { AITextResult } from "@/api";
+import { settings } from "@/lib/settings";
 
 const props = defineProps<{ tab: Tab; active: boolean }>();
 const projects = useProjectsStore();
@@ -44,7 +59,7 @@ const hasTint = computed(() => !!conn.value && conn.value.color !== "none");
 const editor = ref<InstanceType<typeof SqlEditor> | null>(null);
 const sqlText = ref(props.tab.sql ?? "");
 const schemaTables = shallowRef<SchemaTable[]>([]);
-const editorH = ref(190);
+const editorH = ref(Math.max(190, Math.min(330, window.innerHeight - 320)));
 
 // ---- results --------------------------------------------------------------------------
 interface ResTab {
@@ -58,6 +73,8 @@ interface ResTab {
   note?: string;
   /** first table the statement references (export file / INSERT target name) */
   table: string;
+  /** result of an EXPLAIN: the explained statement ("What's slow?") */
+  explainOf?: string;
 }
 const results = ref<ResTab[]>([]);
 const activeRes = ref<string | null>(null);
@@ -229,7 +246,7 @@ async function prepareAndRun(sql: string, offset: number) {
     setResults(rs, offset, undefined, stmts);
     // name the console after what it queries (kept when the user renamed the tab)
     const table = stmts.find((s) => s.table)?.table;
-    if (table && rs.some((r) => !r.error)) tabs.autoTitle(props.tab.id, table);
+    if (table && rs.some((r) => !r.error)) aiTitle(sql, table);
     const first = rs.find((r) => r.hasResultSet) ?? rs[rs.length - 1];
     const dur = rs.reduce((n, r) => n + (r.durationMs || 0), 0);
     const wasCanceled = userCanceled || rs.some((r) => r.error.startsWith("canceled"));
@@ -277,7 +294,8 @@ function setResults(rs: QueryResult[], offset: number, note?: string, stmts: Sta
     const st = r.statement?.trim();
     const at = st ? doc.indexOf(st, i === 0 ? offset : 0) : -1;
     const table = (st && stmts.find((x) => x.sql.trim() === st)?.table) || "";
-    return { id: newId(), title, result: r, rows: toRows(r), docOffset: at >= 0 ? at : offset, note: i === 0 ? note : undefined, table };
+    const explainOf = st && EXPLAIN_RE.test(st) ? st.replace(EXPLAIN_RE, "").trim() : undefined;
+    return { id: newId(), title, result: r, rows: toRows(r), docOffset: at >= 0 ? at : offset, note: i === 0 ? note : undefined, table, explainOf };
   });
   results.value = tabsOut;
   activeRes.value = (tabsOut.find((t) => t.result.error) ?? tabsOut[0])?.id ?? null;
@@ -294,10 +312,15 @@ async function cancel() {
   }
 }
 
+/** EXPLAIN with its options (the explained statement follows) */
+const EXPLAIN_RE = /^\s*explain\s+(?:(?:query\s+plan|analyze|verbose|extended|partitions|format\s*=\s*\w+)\s+|\([^)]*\)\s*)*/i;
+
 async function explain() {
   const s = await statementAtCursor();
   if (!s) return;
-  const sql = /^\s*explain\b/i.test(s.sql) ? s.sql : "EXPLAIN " + s.sql.trim().replace(/;\s*$/, "");
+  // SQLite's plain EXPLAIN lists VM opcodes; EXPLAIN QUERY PLAN is the readable plan
+  const kw = driver.value === "sqlite" ? "EXPLAIN QUERY PLAN " : "EXPLAIN ";
+  const sql = /^\s*explain\b/i.test(s.sql) ? s.sql : kw + s.sql.trim().replace(/;\s*$/, "");
   await execute(sql, s.offset);
 }
 
@@ -323,7 +346,7 @@ function goToError(r: ResTab) {
 }
 
 // ---- history + saved ----------------------------------------------------------------------------------------
-const panel = ref<"" | "history" | "saved">("");
+const panel = ref<"" | "history" | "saved" | "ai">("");
 const history = ref<QueryHistory[]>([]);
 const histSearch = ref("");
 const saved = ref<SavedQuery[]>([]);
@@ -357,6 +380,7 @@ watch(histSearch, () => {
   histTimer = window.setTimeout(loadHistory, 250);
 });
 function loadSql(sql: string) {
+  closeAi({ focus: false });
   editor.value?.setDoc(sql);
   editor.value?.focus();
 }
@@ -366,6 +390,10 @@ async function clearHistory() {
   await queryApi.ClearHistory(connId.value).catch(() => undefined);
   loadHistory();
 }
+/** AI name suggestion for the Save form (prefilled and selected, so typing replaces it) */
+const suggesting = ref(false);
+let nameJob: AiJob<AITextResult> | null = null;
+
 async function startSave() {
   const st = editor.value?.getState();
   if (!st?.doc.trim()) return ui.toast("Nothing to save", "info", 1500);
@@ -375,7 +403,35 @@ async function startSave() {
   saveName.value = "";
   await nextTick();
   saveInput.value?.focus();
+  if (aiReady()) void suggestName(st.selected.trim() ? st.selected : st.doc);
 }
+async function suggestName(sql: string) {
+  nameJob?.cancel();
+  const my = (nameJob = textTask("NameQuery", { connId: connId.value, sql: sql.slice(0, 4000) }));
+  suggesting.value = true;
+  try {
+    const res = await my.promise;
+    // only when the user has not started typing
+    if (nameJob !== my || !saving.value || saveName.value) return;
+    saveName.value = res.text;
+    await nextTick();
+    if (document.activeElement === saveInput.value) saveInput.value?.select();
+  } catch {
+    /* no suggestion */
+  } finally {
+    if (nameJob === my) {
+      nameJob = null;
+      suggesting.value = false;
+    }
+  }
+}
+function stopSuggesting() {
+  nameJob?.cancel();
+  nameJob = null;
+  suggesting.value = false;
+}
+watch(saving, (v) => !v && stopSuggesting());
+watch(saveName, (v) => v && nameJob && stopSuggesting());
 async function confirmSave() {
   const st = editor.value?.getState();
   const name = saveName.value.trim();
@@ -486,6 +542,289 @@ async function formatEditor() {
   ed.focus();
 }
 
+// ---- AI (⌘\) ------------------------------------------------------------------------------------------------
+const aiAvailable = computed(() => settings.aiEnabled && !!settings.aiModel);
+/** widget element of the open prompt (Teleport target), null = closed */
+const aiEl = shallowRef<HTMLElement | null>(null);
+const aiView = shallowRef<EditorView | null>(null);
+const aiTarget = ref<AiTarget | null>(null);
+const aiChangeLabel = ref<string | null>(null);
+const aiPrompt = ref<InstanceType<typeof AiPrompt> | null>(null);
+const aiTask = shallowRef<AiTask | null>(null);
+let aiTargets: Partial<Record<AiMode, AiTarget>> = {};
+let aiOpening = false;
+
+/**
+ * What the prompt works on: the selection, else the statement at the cursor ("change"), and where a
+ * new query goes ("new": on an empty line at the cursor, else on new lines after the statement).
+ */
+async function aiTargetsAt(view: EditorView): Promise<{ targets: Partial<Record<AiMode, AiTarget>>; changeLabel: string | null }> {
+  const st = view.state;
+  const sel = st.selection.main;
+  const doc = st.doc;
+  const after = (pos: number, prefix: string): AiTarget => {
+    const line = doc.lineAt(pos);
+    // keep a blank line before a statement that follows directly
+    const next = line.number < doc.lines ? doc.line(line.number + 1) : null;
+    const suffix = next && next.text.trim() ? "\n" : "";
+    return { mode: "new", from: line.to, to: line.to, side: 1, prefix, suffix };
+  };
+  if (!sel.empty) {
+    return {
+      targets: { change: { mode: "change", from: sel.from, to: sel.to, side: -1, prefix: "", suffix: "" }, new: after(sel.to, "\n\n") },
+      changeLabel: "Change selection",
+    };
+  }
+  const line = doc.lineAt(sel.head);
+  if (!line.text.trim()) {
+    return { targets: { new: { mode: "new", from: line.from, to: line.to, side: -1, prefix: "", suffix: "" } }, changeLabel: null };
+  }
+  let hit: StatementRange | undefined;
+  try {
+    const ranges = await queryApi.SplitStatements(driver.value as string, doc.toString());
+    hit =
+      ranges.find((r) => sel.head >= r.start && sel.head <= r.end) ??
+      // cursor after the ";" on the statement's last line
+      [...ranges].reverse().find((r) => r.end <= sel.head && doc.lineAt(r.end).number === line.number);
+  } catch {
+    /* no statement: new query below the line */
+  }
+  if (!hit) return { targets: { new: after(sel.head, "\n") }, changeLabel: null };
+  const end = doc.sliceString(hit.end, hit.end + 1) === ";" ? hit.end + 1 : hit.end;
+  return {
+    targets: { change: { mode: "change", from: hit.start, to: hit.end, side: -1, prefix: "", suffix: "" }, new: after(end, "\n\n") },
+    changeLabel: "Change this query",
+  };
+}
+
+/** Opens the inline prompt; with opts (Fix, Convert) over a given range, running a task at once. */
+async function openAi(opts?: { target: AiTarget; task: AiTask }) {
+  if (!aiReady()) return void ui.toast(aiOffMessage(), "info", 4000);
+  if (aiEl.value) {
+    if (!opts) return aiPrompt.value?.focus();
+    if (aiPrompt.value?.busy()) return void ui.toast("The AI is still writing; press Esc to stop it first", "info", 2500);
+    closeAi({ focus: false });
+  }
+  const view = editor.value?.getView();
+  if (!view || aiOpening) return;
+  aiOpening = true;
+  try {
+    const { targets, changeLabel } = opts ? { targets: { change: opts.target }, changeLabel: null } : await aiTargetsAt(view);
+    if (aiEl.value || !(targets.new || targets.change)) return;
+    const t = (targets.change ?? targets.new)!;
+    const el = document.createElement("div");
+    el.className = "cm-inline-widget";
+    startInline(view, { from: t.from, to: t.to, side: t.side, dom: el });
+    aiTargets = targets;
+    aiTask.value = opts?.task ?? null;
+    aiChangeLabel.value = changeLabel;
+    aiTarget.value = t;
+    aiView.value = markRaw(view);
+    aiEl.value = el;
+  } finally {
+    aiOpening = false;
+  }
+}
+
+function setAiMode(m: AiMode) {
+  const view = aiView.value;
+  const t = aiTargets[m];
+  if (!view || !t) return;
+  retargetInline(view, { from: t.from, to: t.to, side: t.side });
+  aiTarget.value = t;
+}
+
+/** Closes the prompt; restores the original text unless the result was accepted. */
+function closeAi(opts: { restore?: boolean; focus?: boolean } = {}) {
+  const view = aiView.value;
+  if (!aiEl.value) return;
+  aiPrompt.value?.cancel();
+  if (view && getInline(view)) {
+    if (opts.restore === false) endInline(view);
+    else discardInline(view);
+  }
+  aiEl.value = null;
+  aiView.value = null;
+  aiTarget.value = null;
+  aiTask.value = null;
+  aiTargets = {};
+  releaseAi();
+  if (opts.focus !== false && props.active) editor.value?.focus();
+}
+
+// ---- inline AI suggestions (ghost text, aiGhost.ts) ------------------------------------------
+let ghostWarned = "";
+const ghostOpts: GhostOptions = {
+  enabled: () => aiInlineReady() && props.active && projects.isConnected(connId.value),
+  blocked: (v) => !!getInline(v),
+  onFocus: () => warmInline(),
+  fetch: (req) => {
+    const job = completeSql({ connId: connId.value, schema: schema.value, ...req });
+    const promise = job.promise.then(
+      (r) => r.text,
+      (e) => {
+        // Ollama not running / model missing: say so once per model instead of failing silently
+        const err = aiError(e);
+        const key = `${inlineModel()}:${err?.message}`;
+        if (err?.settings && ghostWarned !== key) {
+          ghostWarned = key;
+          ui.toast(`Inline suggestions: ${err.message}`, "error", 6000);
+        }
+        return "";
+      },
+    );
+    return { promise, cancel: job.cancel };
+  },
+};
+
+function onAiAccepted(r: { from: number; to: number; text: string; run: boolean }) {
+  closeAi({ restore: false });
+  if (!r.run) return;
+  const sql = r.text.trim().replace(/;\s*$/, "");
+  if (sql) void execute(sql, r.from + r.text.length - r.text.trimStart().length);
+}
+
+// ---- AI tasks: fix, convert (inline), explain, what's slow (side panel), tab title -------------------------
+/** The failed statement of a result in the editor: its range now (the editor may have changed). */
+function failedRange(r: ResTab): { from: number; to: number; sql: string } | null {
+  const doc = editor.value?.getState().doc ?? "";
+  let stmt = (r.result.statement ?? "").trim();
+  if (!stmt) return null;
+  const find = (s: string) => {
+    if (doc.startsWith(s, r.docOffset)) return r.docOffset;
+    const near = doc.indexOf(s, Math.max(0, r.docOffset - 200));
+    return near >= 0 ? near : doc.indexOf(s);
+  };
+  let at = find(stmt);
+  if (at < 0 && EXPLAIN_RE.test(stmt)) {
+    stmt = stmt.replace(EXPLAIN_RE, "").trim();
+    at = find(stmt);
+  }
+  return at < 0 ? null : { from: at, to: at + stmt.length, sql: stmt };
+}
+
+/** The error can be fixed by changing the statement (not canceled / blocked on a read-only connection). */
+function fixable(r: ResTab | null): boolean {
+  if (!r?.result.error || r.note) return false;
+  const e = r.result.error;
+  return !e.startsWith("canceled") && !(readOnly.value && RO_RE.test(e));
+}
+
+async function fixWithAi(r: ResTab | null = activeResult.value) {
+  if (!aiReady()) return void ui.toast(aiOffMessage(), "info", 4000);
+  if (!r || !fixable(r)) return void ui.toast("There is no failed query to fix", "info", 2000);
+  const range = failedRange(r);
+  if (!range) return void ui.toast("The failed statement is no longer in the editor", "warning", 3000);
+  const error = r.result.error;
+  const task: AiTask = {
+    label: "Fix",
+    doing: "Fixing the query",
+    start: (onChunk, retry) => sqlTask("FixSQL", { connId: connId.value, schema: schema.value, sql: range.sql, error, retry }, onChunk, { session: true }),
+  };
+  await openAi({ target: { mode: "change", from: range.from, to: range.to, side: -1, prefix: "", suffix: "" }, task });
+}
+
+const DIALECTS: { id: Driver; label: string }[] = [
+  { id: "mysql", label: "MySQL" },
+  { id: "postgres", label: "PostgreSQL" },
+  { id: "sqlite", label: "SQLite" },
+];
+
+/** The selection, else the statement at the cursor, as an inline target. */
+async function selectionOrStatement(): Promise<{ from: number; to: number; sql: string } | null> {
+  const st = editor.value?.getState();
+  if (!st) return null;
+  if (st.selected.trim()) return { from: st.from, to: st.to, sql: st.selected };
+  const view = editor.value?.getView();
+  if (!view) return null;
+  const { targets } = await aiTargetsAt(view);
+  const t = targets.change;
+  return t ? { from: t.from, to: t.to, sql: view.state.sliceDoc(t.from, t.to) } : null;
+}
+
+async function convertWithAi(target: Driver) {
+  if (!aiReady()) return void ui.toast(aiOffMessage(), "info", 4000);
+  const r = await selectionOrStatement();
+  if (!r?.sql.trim()) return void ui.toast("Put the cursor in a statement or select the SQL to convert", "info", 2500);
+  const label = DIALECTS.find((d) => d.id === target)?.label ?? target;
+  const task: AiTask = {
+    label: `→ ${label}`,
+    doing: `Converting to ${label}`,
+    start: (onChunk, retry) => sqlTask("ConvertSQL", { connId: connId.value, sql: r.sql, target, retry }, onChunk, { session: true }),
+  };
+  await openAi({ target: { mode: "change", from: r.from, to: r.to, side: -1, prefix: "", suffix: "" }, task });
+}
+
+/** Side panel answer (Explain with AI / What's slow?) */
+const aiAnswer = ref<AiAnswerRequest | null>(null);
+
+async function explainWithAi() {
+  if (!aiReady()) return void ui.toast(aiOffMessage(), "info", 4000);
+  const s = await statementAtCursor();
+  if (!s?.sql.trim()) return void ui.toast("Put the cursor in a statement or select the SQL to explain", "info", 2500);
+  const sql = s.sql.trim().replace(EXPLAIN_RE, "");
+  aiAnswer.value = { key: newId(), kind: "explain", connId: connId.value, schema: schema.value, sql };
+  panel.value = "ai";
+}
+
+/** EXPLAIN output as TSV with a header line (at most 200 rows). */
+function planText(r: QueryResult): string {
+  const clean = (v: string) => v.replace(/[\t\r\n]+/g, " ").trim();
+  const lines = [r.columns.map((c) => c.name).join("\t")];
+  for (const row of r.rows.slice(0, 200)) lines.push(row.map((v) => (v === null ? "NULL" : clean(cellText(v)))).join("\t"));
+  return lines.join("\n");
+}
+
+function whatsSlow(r: ResTab | null = activeResult.value) {
+  if (!aiReady()) return void ui.toast(aiOffMessage(), "info", 4000);
+  if (!r?.explainOf || !r.result.hasResultSet) return void ui.toast("Run Explain first", "info", 2000);
+  aiAnswer.value = { key: newId(), kind: "plan", connId: connId.value, schema: schema.value, sql: r.explainOf, plan: planText(r.result) };
+  panel.value = "ai";
+}
+
+function closeAnswer() {
+  if (panel.value === "ai") panel.value = "";
+  aiAnswer.value = null;
+  if (props.active) editor.value?.focus();
+}
+
+/** AI menu (toolbar) */
+const aiMenu = ref<{ x: number; y: number } | null>(null);
+function aiMenuItems(): MenuItem[] {
+  const r = activeResult.value;
+  return [
+    { label: "Write or change SQL…", hint: kbd("⌘\\"), run: () => void openAi() },
+    { label: "Explain query", hint: kbd("⌥⌘E"), run: () => void explainWithAi() },
+    { label: "Fix the failed query", hint: kbd("⌥⌘F"), disabled: !fixable(r), run: () => void fixWithAi() },
+    { label: "What's slow? (EXPLAIN result)", disabled: !r?.explainOf || !r.result.hasResultSet, run: () => whatsSlow() },
+    { separator: true },
+    ...DIALECTS.filter((d) => d.id !== driver.value).map((d) => ({ label: `Convert to ${d.label}`, run: () => void convertWithAi(d.id) })),
+  ];
+}
+
+/**
+ * Names the tab after a successful run: a short AI title when AI is on (not when the model is
+ * unloaded after every request: naming would load it on every run), else the first table.
+ */
+let titledSql = "";
+let titleJob: AiJob<AITextResult> | null = null;
+function aiTitle(sql: string, table: string) {
+  if (props.tab.customTitle) return;
+  if (!aiReady() || settings.aiKeepAlive === "0") return tabs.autoTitle(props.tab.id, table);
+  const key = sql.trim().replace(EXPLAIN_RE, "");
+  if (key === titledSql) return;
+  titleJob?.cancel();
+  const my = (titleJob = textTask("NameQuery", { connId: connId.value, sql: key.slice(0, 4000) }));
+  my.promise
+    .then((res) => {
+      if (titleJob !== my) return;
+      titledSql = key;
+      tabs.autoTitle(props.tab.id, res.text);
+    })
+    .catch(() => titleJob === my && tabs.autoTitle(props.tab.id, table))
+    .finally(() => titleJob === my && (titleJob = null));
+}
+
 // ---- layout (editor / results splitter) ----------------------------------------------------------------------------------
 function startSplit(e: MouseEvent) {
   const y0 = e.clientY;
@@ -506,7 +845,10 @@ watch(sqlText, (v) => {
   saveTimer = window.setTimeout(() => tabs.update(props.tab.id, { sql: v }), 400);
 });
 watch(() => props.tab.sql, (v) => {
-  if (v !== undefined && v !== sqlText.value) editor.value?.setDoc(v);
+  if (v !== undefined && v !== sqlText.value) {
+    closeAi({ focus: false });
+    editor.value?.setDoc(v);
+  }
 });
 
 /** The editor only takes focus when the opener asked for it (tabs.consumeFocus). */
@@ -527,6 +869,9 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onWinKey);
+  closeAi({ focus: false });
+  stopSuggesting();
+  titleJob?.cancel();
   // flush the pending (debounced) save so the last keystrokes are kept in the tab state
   clearTimeout(saveTimer);
   clearInterval(elapsedTimer);
@@ -541,6 +886,27 @@ watch(() => props.active, (a) => {
 
 function onWinKey(e: KeyboardEvent) {
   if (!props.active || ui.overlayOpen) return;
+  // Cmd+\ opens the AI prompt from anywhere in the console (the editor's keymap handles it there)
+  if (isMod(e) && !e.altKey && (e.key === "\\" || e.code === "Backslash")) {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    void openAi();
+    return;
+  }
+  // ⌥⌘F fix the failed query, ⌥⌘E explain the statement at the cursor (e.code: ⌥ changes e.key on macOS)
+  if (isMod(e) && e.altKey && !e.shiftKey && (e.code === "KeyF" || e.code === "KeyE")) {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    if (e.code === "KeyF") void fixWithAi();
+    else void explainWithAi();
+    return;
+  }
+  // Esc closes the AI answer panel (unless something else used it: completion, inline prompt, inputs)
+  if (e.key === "Escape" && panel.value === "ai" && !e.defaultPrevented && !(e.target as HTMLElement | null)?.closest("input, textarea, select")) {
+    e.preventDefault();
+    closeAnswer();
+    return;
+  }
   // Cmd+. cancels a running query
   if (isMod(e) && e.key === ".") {
     e.preventDefault();
@@ -569,6 +935,14 @@ function onWinKey(e: KeyboardEvent) {
       <button class="btn" :disabled="running" :title="kbd('Run everything (⌘⇧↵)')" @click="runAll"><Icon name="play" /> Run all <kbd>{{ kbd("⌘⇧↵") }}</kbd></button>
       <button class="btn ghost" :disabled="running" title="EXPLAIN the statement at the cursor" @click="explain"><Icon name="explain" /> Explain</button>
       <button class="btn ghost" :title="kbd('Format the selection, or the whole script (⌥⇧F)')" @click="formatEditor">Format</button>
+      <button
+        v-if="aiAvailable" class="btn ghost ai" :class="{ on: !!aiEl }"
+        :title="kbd(`Write or change SQL with ${settings.aiModel} (⌘\\)`)" @click="openAi()"
+      ><Icon name="sparkle" /> AI <kbd>{{ kbd("⌘\\") }}</kbd></button>
+      <button
+        v-if="aiAvailable" class="btn ghost aim" title="More AI actions: explain, fix, what's slow, convert"
+        @click="aiMenu = { x: ($event.currentTarget as HTMLElement).getBoundingClientRect().left, y: ($event.currentTarget as HTMLElement).getBoundingClientRect().bottom + 2 }"
+      ><Icon name="chevD" :size="10" /></button>
       <span class="sep"></span>
       <button class="btn ghost" :title="kbd('Save query (⌘S)')" @click="startSave"><Icon name="bookmark" /> Save</button>
       <button class="btn ghost" :class="{ on: panel === 'saved' }" @click="openPanel('saved')">Saved</button>
@@ -590,7 +964,14 @@ function onWinKey(e: KeyboardEvent) {
             ref="editor" v-model="sqlText" :driver="driver" :tables="schemaTables"
             :placeholder-text="kbd('SELECT * FROM … — ⌘↵ runs the statement at the cursor')"
             @run="runCursor" @run-all="runAll" @save-query="startSave" @format="formatEditor"
+            :ghost="ghostOpts" @ai="openAi()" @ai-escape="closeAi()"
           />
+          <Teleport v-if="aiEl && aiView && aiTarget" :to="aiEl">
+            <AiPrompt
+              ref="aiPrompt" :view="aiView" :conn-id="connId" :schema="schema" :target="aiTarget" :change-label="aiChangeLabel" :task="aiTask"
+              @mode="setAiMode" @close="closeAi()" @accepted="onAiAccepted"
+            />
+          </Teleport>
         </div>
         <div class="split" @mousedown.prevent="startSplit"></div>
 
@@ -604,6 +985,10 @@ function onWinKey(e: KeyboardEvent) {
             {{ r.title }}<span v-if="r.result.hasResultSet && !r.result.error" class="dim mono"> {{ fmtNum(r.result.rows.length) }}</span>
           </div>
           <span class="flex-1"></span>
+          <button
+            v-if="aiAvailable && activeResult?.explainOf && activeResult.result.hasResultSet" class="btn ghost ai"
+            title="Ask the AI what makes this query slow and which indexes would help (nothing is run)" @click="whatsSlow()"
+          ><Icon name="sparkle" /> What's slow?</button>
           <button v-if="activeResult?.result.hasResultSet" class="btn ghost" @click="resMenu = { x: $event.clientX, y: $event.clientY }"><Icon name="copy" /> Copy as</button>
           <button v-if="activeResult?.result.hasResultSet" class="btn ghost" title="Export the result to a file (CSV, JSON, SQL INSERT, …)" @click="openExport"><Icon name="export" /> Export</button>
         </div>
@@ -619,6 +1004,10 @@ function onWinKey(e: KeyboardEvent) {
                 <b>{{ activeResult.result.error.startsWith("canceled") ? "Query canceled" : "Query failed" }}</b>
                 <button v-if="errorLine(activeResult)" class="btn ghost lnk" @click="goToError(activeResult)">Go to {{ errorLine(activeResult)!.label }}</button>
                 <button v-else class="btn ghost lnk" @click="goToError(activeResult)">Go to statement</button>
+                <button
+                  v-if="aiAvailable && fixable(activeResult)" class="btn ai fix" :title="kbd('Let the AI fix the statement in the editor; you review the change (⌥⌘F)')"
+                  @click="fixWithAi(activeResult)"
+                ><Icon name="sparkle" /> Fix with AI <kbd>{{ kbd("⌥⌘F") }}</kbd></button>
               </div>
               <pre class="mono">{{ friendlyError(activeResult.result.error) }}</pre>
               <pre v-if="activeResult.note" class="mono dim">{{ activeResult.note }}</pre>
@@ -648,8 +1037,9 @@ function onWinKey(e: KeyboardEvent) {
       </div>
 
       <!-- history / saved panel -->
-      <aside v-if="panel" class="side">
-        <template v-if="panel === 'history'">
+      <aside v-if="panel" class="side" :class="{ wide: panel === 'ai' }">
+        <AiAnswer v-if="panel === 'ai' && aiAnswer" :request="aiAnswer" @close="closeAnswer" />
+        <template v-else-if="panel === 'history'">
           <div class="side-h">
             <span>History</span><span class="flex-1"></span>
             <button class="btn ghost" title="Clear history" @click="clearHistory"><Icon name="trash" /></button>
@@ -668,7 +1058,10 @@ function onWinKey(e: KeyboardEvent) {
         <template v-else>
           <div class="side-h"><span>Saved queries</span></div>
           <form v-if="saving" class="p-2 flex gap-1" @submit.prevent="confirmSave">
-            <input ref="saveInput" v-model="saveName" class="input" style="flex: 1" placeholder="Name" @keydown.esc.stop="saving = false" />
+            <input
+              ref="saveInput" v-model="saveName" class="input" style="flex: 1" :placeholder="suggesting ? 'Name (suggesting…)' : 'Name'"
+              @keydown.esc.stop="saving = false"
+            />
             <button class="btn primary" type="submit" :disabled="!saveName.trim()">Save</button>
           </form>
           <div class="side-list">
@@ -685,6 +1078,7 @@ function onWinKey(e: KeyboardEvent) {
       </aside>
     </div>
     <ContextMenu v-if="resMenu" :x="resMenu.x" :y="resMenu.y" :items="resCopyItems()" @close="resMenu = null" />
+    <ContextMenu v-if="aiMenu" :x="aiMenu.x" :y="aiMenu.y" :items="aiMenuItems()" @close="aiMenu = null" />
   </div>
 </template>
 
@@ -692,6 +1086,10 @@ function onWinKey(e: KeyboardEvent) {
 .tb { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-bottom: 1px solid var(--bd); flex: none; flex-wrap: wrap; }
 .sep { width: 1px; height: 16px; background: var(--bd); }
 .btn.on { background: var(--hov); }
+.btn.ai :deep(svg) { color: var(--ac); }
+.btn.aim { padding: 0 3px; margin-left: -5px; }
+.btn.fix { height: 20px; padding: 0 8px; font-size: 11px; }
+.btn.fix kbd { font-size: 9px; }
 .pill.ro { display: inline-flex; align-items: center; gap: 4px; }
 .split { height: 5px; flex: none; cursor: row-resize; border-top: 1px solid var(--bd); background: var(--bg2); }
 .split:hover { background: var(--ac); opacity: .5; }
@@ -709,6 +1107,7 @@ function onWinKey(e: KeyboardEvent) {
 .rok :deep(.ok) { color: var(--ok); }
 .rok pre { margin: 0; white-space: pre-wrap; }
 .note { padding: 3px 10px; font-size: 11px; color: var(--warn); background: var(--bg2); border-top: 1px solid var(--bd); }
+.side.wide { width: 340px; }
 .side { width: 270px; flex: none; border-left: 1px solid var(--bd); background: var(--bg2); display: flex; flex-direction: column; min-height: 0; }
 .side-h { display: flex; align-items: center; padding: 4px 6px 4px 10px; border-bottom: 1px solid var(--bd); font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; height: 30px; }
 .side-list { overflow: auto; flex: 1; }

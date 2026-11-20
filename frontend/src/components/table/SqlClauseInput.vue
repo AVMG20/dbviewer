@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // DataGrip-style raw SQL clause input (WHERE / ORDER BY): a single-line CodeMirror 6 editor with SQL
 // highlighting (dialect per driver), column + keyword/operator autocomplete, Enter applies.
+// Esc emits "escape" (TableView reverts an AI suggestion); ⌘\ emits "ai" (plain-language filter).
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, keymap, placeholder as cmPlaceholder } from "@codemirror/view";
@@ -15,7 +16,7 @@ import { appHighlight, appTheme } from "@/components/console/cmTheme";
 const props = defineProps<{
   modelValue: string; label: string; placeholder?: string; columns: string[]; error?: string; driver?: string;
 }>();
-const emit = defineEmits<{ "update:modelValue": [v: string]; apply: [] }>();
+const emit = defineEmits<{ "update:modelValue": [v: string]; apply: []; escape: []; ai: [] }>();
 
 const host = ref<HTMLElement | null>(null);
 let view: EditorView | null = null;
@@ -79,7 +80,10 @@ onMounted(() => {
           { key: "Tab", run: acceptCompletion },
           { key: "Enter", run: () => (emit("apply"), true) },
           { key: "Mod-Enter", run: () => (emit("apply"), true) },
-          ...closeBracketsKeymap, ...completionKeymap, ...historyKeymap, ...defaultKeymap.filter((b) => b.key !== "Enter" && b.key !== "Mod-Enter"),
+          ...closeBracketsKeymap, ...completionKeymap,
+          { key: "Escape", run: () => (emit("escape"), false) },
+          { key: "Mod-\\", run: () => (emit("ai"), true) },
+          ...historyKeymap, ...defaultKeymap.filter((b) => b.key !== "Enter" && b.key !== "Mod-Enter"),
         ]),
         history(),
         bracketMatching(),
@@ -107,7 +111,15 @@ watch(() => props.modelValue, (v) => {
 });
 watch(() => props.driver, () => view?.dispatch({ effects: langConf.reconfigure(sql({ dialect: dialect() })) }));
 
-defineExpose({ focus: () => view?.focus() });
+defineExpose({
+  /** focus with the cursor at the end (or everything selected) */
+  focus: (opts: { select?: boolean } = {}) => {
+    if (!view) return;
+    const n = view.state.doc.length;
+    view.dispatch({ selection: opts.select ? { anchor: 0, head: n } : { anchor: n } });
+    view.focus();
+  },
+});
 </script>
 
 <template>

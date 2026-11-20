@@ -9,6 +9,7 @@
 
 import { Events, CancellablePromise } from "@wailsio/runtime";
 import {
+  AIService,
   ConnectionService,
   DataService,
   ProjectService,
@@ -16,7 +17,7 @@ import {
   SchemaService,
 } from "../../bindings/dbviewer/internal/services";
 import type * as M from "../../bindings/dbviewer/internal/model";
-import { ConnStatus, FindProgress as FindProgressEvent, SshHostkey, SshPassphrase } from "../../bindings/events";
+import { AiChunk, ConnStatus, FindProgress as FindProgressEvent, SshHostkey, SshPassphrase } from "../../bindings/events";
 
 // ---------------------------------------------------------------------------
 // Type cleanup: the Go side guarantees slices/maps are never null (they are []
@@ -117,6 +118,16 @@ export type FindResult = Omit<Clean<M.FindResult>, "result"> & { result: QueryRe
 export type QueryHistory = Clean<M.QueryHistory>;
 export type SavedQuery = Clean<M.SavedQuery>;
 export type AppInfo = Clean<M.AppInfo>;
+export type AIModel = Clean<M.AIModel>;
+export type AISettings = Clean<M.AISettings>;
+export type AISQLRequest = Clean<M.AISQLRequest>;
+export type AISQLResult = Clean<M.AISQLResult>;
+export type AIChunk = Clean<M.AIChunk>;
+export type AITaskRequest = Clean<M.AITaskRequest>;
+export type AITextResult = Clean<M.AITextResult>;
+export type AIFilterResult = Clean<M.AIFilterResult>;
+export type AICompleteRequest = Clean<M.AICompleteRequest>;
+export type AICompleteResult = Clean<M.AICompleteResult>;
 
 // ---------------------------------------------------------------------------
 // Services (1:1 with the Go services; signatures documented in CONTRACT.md)
@@ -130,6 +141,19 @@ export const dataApi = {
   ...dataRaw,
   FetchPage: dataRaw.FetchPage as (req: PageRequest) => CancellablePromise<QueryResult>,
 };
+/**
+ * Local AI (Ollama): Models(baseUrl) rejects with not_connected when Ollama is not running;
+ * Warm(settings) preloads the model; Unload(settings) frees it; GenerateSQL(req) streams
+ * "ai:chunk" events (onAiChunk) and resolves with the final statement; cancel the promise
+ * to stop it. A missing model rejects with not_found.
+ * Tasks (AITaskRequest; each uses the fields it needs): FixSQL (sql + error), ConvertSQL (sql +
+ * target) stream SQL like GenerateSQL; ExplainSQL (sql) and ExplainPlan (sql + plan as TSV) stream
+ * text (chunk.text); NameQuery (sql) and FilterRows (table + prompt; reads the distinct values of
+ * status-like columns read-only) are not streamed.
+ * CompleteSQL(req: AICompleteRequest {before, after}) suggests the text at the cursor of the SQL
+ * console (inline ghost text, "" = none); not streamed, cancel the promise when the editor changes.
+ */
+export const aiApi = AIService as unknown as CleanService<typeof AIService>;
 export const runQuery = QueryService.RunQuery as unknown as (req: QueryRequest) => CancellablePromise<QueryResult[]>;
 
 /** found["format"] of connectionApi.ParseConnectionString. */
@@ -175,6 +199,11 @@ export function onSshPassphrase(cb: (p: SSHKeyPrompt) => void): () => void {
 /** Progress of FindInDatabase (one event per searched table). */
 export function onFindProgress(cb: (p: FindProgress) => void): () => void {
   return Events.On(FindProgressEvent, (ev) => cb(ev.data as FindProgress));
+}
+
+/** SQL (or text) streamed by aiApi.GenerateSQL and the AI tasks (the whole text so far; match chunk.requestId). */
+export function onAiChunk(cb: (c: AIChunk) => void): () => void {
+  return Events.On(AiChunk, (ev) => cb(ev.data as AIChunk));
 }
 
 // ---------------------------------------------------------------------------

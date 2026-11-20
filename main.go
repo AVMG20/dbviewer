@@ -28,6 +28,7 @@ func main() {
 			application.NewService(services.NewSchemaService(core)),
 			application.NewService(services.NewDataService(core)),
 			application.NewService(services.NewQueryService(core)),
+			application.NewService(services.NewAIService(core)),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

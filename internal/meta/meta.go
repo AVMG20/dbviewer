@@ -192,3 +192,13 @@ func (c *Cache) Cached(connID string) map[string][]model.Table {
 	}
 	return out
 }
+
+// Snapshot returns the cached tables and the columns of every table of a schema
+// (loading them when needed). The returned values are shared: do not modify them.
+func (c *Cache) Snapshot(ctx context.Context, p *conn.Pool, schema string) ([]model.Table, map[string][]model.Column, error) {
+	e, err := c.load(ctx, p, schema, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return e.tables, e.columns, nil
+}
