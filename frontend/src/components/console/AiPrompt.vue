@@ -1,15 +1,14 @@
 <script setup lang="ts">
 // Inline AI prompt (⌘\ in the SQL console), rendered into the block widget of an inline edit
-// session (aiInline.ts) via <Teleport> from SqlConsole. Generates / changes SQL with the local
-// model (lib/ai.ts), streams it into the editor as a preview, then Accept (Tab / ↵ on an empty
+// session (aiInline.ts) via <Teleport> from SqlConsole. Generates / changes SQL via Antigravity CLI
+// (lib/ai.ts), streams it into the editor as a preview, then Accept (Tab / ↵ on an empty
 // input), Accept & run (⌘↵), Discard (Esc) or Retry. A new instruction refines the preview.
 // With a `task` (Fix with AI, Convert to …) the task runs at once over the target; the prompt
 // then refines its result the same way.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { EditorView } from "@codemirror/view";
 import type { AIChunk, AISQLResult } from "@/api";
-import { aiError, fmtDuration, generateSql, promptHistory, rememberPrompt, warm, type AiJob } from "@/lib/ai";
-import { settings } from "@/lib/settings";
+import { aiError, fmtDuration, generateSql, promptHistory, rememberPrompt, type AiJob } from "@/lib/ai";
 import { kbd } from "@/lib/kbd";
 import { isMod } from "@/lib/keys";
 import { useUiStore } from "@/stores/ui";
@@ -57,7 +56,6 @@ const phase = ref<"idle" | "running" | "done" | "error">("idle");
 const thinking = ref(false);
 const gotChunk = ref(false);
 const elapsed = ref(0);
-const warming = ref(true);
 const result = ref<AISQLResult | null>(null);
 const error = ref<{ message: string; settings: boolean } | null>(null);
 let job: AiJob | null = null;
@@ -87,7 +85,7 @@ async function generate(retry = false) {
     rememberPrompt(prompt);
     const req = { prompt, sql: lastSql ?? (props.target.mode === "change" ? s.original.trim() : "") };
     lastRun.value = (onChunk, r) =>
-      generateSql({ connId: props.connId, schema: props.schema, prompt: req.prompt, sql: req.sql, context: props.view.state.doc.toString(), retry: r }, onChunk, { session: true });
+      generateSql({ connId: props.connId, schema: props.schema, prompt: req.prompt, sql: req.sql, context: props.view.state.doc.toString(), retry: r }, onChunk);
   }
   if (lastRun.value) await run(lastRun.value, retry);
 }
@@ -230,20 +228,12 @@ const placeholder = computed(() =>
       ? "How should the query change? e.g. only paid orders, add the customer email"
       : "Describe the query, e.g. orders from last week with the customer email",
 );
-const runningText = computed(() => (thinking.value ? "Thinking…" : gotChunk.value ? "Writing…" : warming.value ? "Loading model…" : "Waiting for the model…"));
+const runningText = computed(() => (thinking.value ? "Thinking…" : gotChunk.value ? "Writing…" : "Waiting for Antigravity…"));
 const taskTitle = computed(() => (props.task ? props.task.doing : ""));
 
 onMounted(() => {
   focus();
   if (props.task) void runTask();
-  // load the model while the user types
-  void warm().then((err) => {
-    warming.value = false;
-    if (err && (err.code === "not_connected" || err.code === "not_found") && phase.value === "idle") {
-      error.value = { message: err.message, settings: true };
-      phase.value = "error";
-    }
-  });
 });
 onBeforeUnmount(() => {
   clearInterval(timer);
@@ -297,7 +287,6 @@ defineExpose({ focus, cancel, busy: () => phase.value === "running" });
       </template>
       <template v-else>
         <span class="dim">
-          <template v-if="warming">Loading {{ settings.aiModel }}… · </template>
           <kbd>↵</kbd> {{ target.mode === "change" ? "change" : "write" }} · <kbd>↑</kbd> previous prompts · <kbd>Esc</kbd> close
         </span>
       </template>

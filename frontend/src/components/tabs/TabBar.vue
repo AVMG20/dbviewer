@@ -5,6 +5,8 @@
 // an empty name restores automatic naming, see tabs.rename / tabs.autoTitle).
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { kbd } from "@/lib/kbd";
+import { aiError, aiNameReady, aiOffMessage, textTask, type AiJob } from "@/lib/ai";
+import type { AITextResult } from "@/api";
 import { useChangesStore } from "@/stores/changes";
 import { useProjectsStore } from "@/stores/projects";
 import { useTabsStore } from "@/stores/tabs";
@@ -77,6 +79,35 @@ function onTabClick(e: MouseEvent, t: Tab) {
 // ---- rename (console tabs) ----------------------------------------------------------
 const renaming = ref<string | null>(null);
 const renameText = ref("");
+const aiRenaming = ref<Record<string, boolean>>({});
+const renameJobs = new Map<string, AiJob<AITextResult>>();
+const EXPLAIN_RE = /^\s*explain\s+(?:(?:query\s+plan|analyze|verbose|extended|partitions|format\s*=\s*\w+)\s+|\([^)]*\)\s*)*/i;
+
+async function renameWithAi(t: Tab) {
+  if (t.kind !== "console") return;
+  if (!aiNameReady()) return void ui.toast(aiOffMessage(), "info", 4000);
+  const sql = (t.sql ?? "").trim().replace(EXPLAIN_RE, "");
+  if (!sql) return void ui.toast("Write a query in this console first", "info", 2000);
+  renameJobs.get(t.id)?.cancel();
+  const job = textTask("NameQuery", { connId: t.connId, sql: sql.slice(0, 4000) });
+  renameJobs.set(t.id, job);
+  aiRenaming.value = { ...aiRenaming.value, [t.id]: true };
+  try {
+    const res = await job.promise;
+    if (renameJobs.get(t.id) !== job) return;
+    tabs.setAiTitle(t.id, res.text, true);
+  } catch (e) {
+    if (renameJobs.get(t.id) !== job) return;
+    const err = aiError(e);
+    if (err) ui.toast(err.message, "error");
+  } finally {
+    if (renameJobs.get(t.id) === job) {
+      renameJobs.delete(t.id);
+      const { [t.id]: _, ...rest } = aiRenaming.value;
+      aiRenaming.value = rest;
+    }
+  }
+}
 async function startRename(t: Tab) {
   if (t.kind !== "console") return;
   renaming.value = t.id;
@@ -149,7 +180,11 @@ onMounted(() => {
   }
   measure();
 });
-onBeforeUnmount(() => ro?.disconnect());
+onBeforeUnmount(() => {
+  ro?.disconnect();
+  for (const job of renameJobs.values()) job.cancel();
+  renameJobs.clear();
+});
 // also when tabs are reordered / renamed / pinned (the active tab may move or grow off-screen)
 watch(
   () => [tabs.activeId, tabs.tabs.map((t) => `${t.id}\u0000${t.title}\u0000${t.pinned ? 1 : 0}`).join("\u0001")] as const,
@@ -216,7 +251,14 @@ const menuItems = computed<MenuItem[]>(() => {
     { id: "all", label: "Close all" },
     { separator: true },
     { id: "pin", label: t.pinned ? "Unpin" : "Pin" },
-    ...(t.kind === "console" ? [{ id: "rename", label: "Rename…" }] : []),
+    ...(t.kind === "console"
+      ? [
+          { id: "rename", label: "Rename…" },
+          ...(aiNameReady()
+            ? [{ id: "renameAi", label: aiRenaming.value[t.id] ? "Renaming with AI…" : "Rename with AI", disabled: !!aiRenaming.value[t.id] || !(t.sql ?? "").trim() }]
+            : []),
+        ]
+      : []),
     ...(t.kind === "table" ? [{ id: "structure", label: "Open structure" }] : []),
     ...(t.kind === "structure" ? [{ id: "data", label: "Open data" }] : []),
     { id: "reveal", label: "Reveal in sidebar" },
@@ -238,7 +280,7 @@ async function runMenu(id: string) {
   else if (id === "rename") {
     tabs.activate(t.id);
     setTimeout(() => void startRename(t)); // after the menu closed and restored focus
-  }
+  } else if (id === "renameAi") void renameWithAi(t);
   else if (id === "structure" && t.table) tabs.openStructure(t.connId, t.schema ?? "", t.table);
   else if (id === "data" && t.table) tabs.openTable(t.connId, t.schema ?? "", t.table);
   else if (id === "reveal") ui.revealInSidebar(t.connId, t.schema, t.table);
@@ -279,6 +321,7 @@ async function runMenu(id: string) {
             @keydown="onRenameKey" @blur="endRename(true)" @click.stop @dblclick.stop @mousedown.stop
           />
           <span v-else class="title truncate" :class="{ mono: t.kind !== 'console', preview: t.preview }">{{ t.title }}</span>
+          <Icon v-if="aiRenaming[t.id]" name="sparkle" :size="11" class="ai-spin flex-none" title="Renaming with AI…" />
           <span v-if="connOf(t)?.readOnly" :class="isRed(t) ? 'text-danger' : 'dim'" title="Read-only"><Icon name="lock" :size="10" /></span>
           <span v-if="pending(t) > 0" class="bdg" :title="`${pending(t)} pending change(s)`">{{ pending(t) }}</span>
           <span v-else-if="t.dirty" class="dirty" title="Unsaved changes" />
@@ -359,4 +402,6 @@ async function runMenu(id: string) {
 .x:hover { background: var(--bg3); color: var(--tx); }
 .bdg { background: var(--ac); color: var(--ac-fg, #fff); border-radius: 8px; padding: 0 5px; font-size: 10px; line-height: 14px; }
 .dirty { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); flex: none; }
+.ai-spin { color: var(--ac); animation: ai-pulse 1.2s ease-in-out infinite; }
+@keyframes ai-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 </style>

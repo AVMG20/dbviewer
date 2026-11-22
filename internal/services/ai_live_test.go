@@ -9,8 +9,66 @@ import (
 	"strings"
 	"testing"
 
+	"dbviewer/internal/ai"
 	"dbviewer/internal/model"
 )
+
+// TestAgyLive runs Antigravity CLI model discovery, SQL generation, explain, and naming
+// against the SQLite dummy database.
+// Opt-in: DBVIEWER_AGY_LIVE=1 go test ./internal/services -run TestAgyLive -v
+func TestAgyLive(t *testing.T) {
+	if os.Getenv("DBVIEWER_AGY_LIVE") == "" {
+		t.Skip("set DBVIEWER_AGY_LIVE=1 to run against Antigravity CLI (agy)")
+	}
+	realHome := os.Getenv("HOME")
+	c := testCore(t)
+	if realHome != "" {
+		t.Setenv("HOME", realHome)
+	}
+	ctx := context.Background()
+	projects, _ := NewProjectService(c).Projects()
+	saved, err := NewConnectionService(c).SaveConnection(model.ConnectionConfig{
+		ProjectID: projects[0].ID, Name: "sqlite", Driver: model.DriverSQLite, ReadOnly: true,
+		FilePath: filepath.Join(repoRoot(), "testdata", "dummy.sqlite"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewAIService(c)
+	qs := NewQueryService(c)
+
+	models, err := svc.AgyModels(ctx)
+	if err != nil {
+		t.Fatalf("AgyModels: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatalf("AgyModels returned empty list")
+	}
+	t.Logf("AgyModels returned %d models (first: %s / %s)", len(models), models[0].Name, models[0].Label)
+
+	set := model.AISettings{Provider: ai.ProviderAgy, Model: ai.DefaultAgyModel}
+	res, err := svc.GenerateSQL(ctx, model.AISQLRequest{AISettings: set, ConnID: saved.ID, Prompt: "top 5 customers by total order amount"})
+	if err != nil {
+		t.Fatalf("GenerateSQL: %v", err)
+	}
+	t.Logf("GenerateSQL (%d ms, model %s):\n%s", res.DurationMs, res.Model, res.SQL)
+	out, err := qs.RunQuery(ctx, model.QueryRequest{ConnID: saved.ID, SQL: res.SQL, MaxRows: 5})
+	if err != nil || len(out) == 0 || out[0].Error != "" {
+		t.Fatalf("generated SQL failed to run: %v %+v", err, out)
+	}
+
+	ex, err := svc.ExplainSQL(ctx, model.AITaskRequest{AISettings: set, ConnID: saved.ID, SQL: res.SQL})
+	if err != nil {
+		t.Fatalf("ExplainSQL: %v", err)
+	}
+	t.Logf("ExplainSQL (%d ms): %s", ex.DurationMs, ex.Text)
+
+	name, err := svc.NameQuery(ctx, model.AITaskRequest{AISettings: set, ConnID: saved.ID, SQL: res.SQL})
+	if err != nil {
+		t.Fatalf("NameQuery: %v", err)
+	}
+	t.Logf("NameQuery (%d ms): %q", name.DurationMs, name.Text)
+}
 
 // TestAILive runs GenerateSQL against a real Ollama with the SQLite dummy database.
 // Opt-in: DBVIEWER_OLLAMA_MODEL=qwen3:4b-instruct go test ./internal/services -run TestAILive -v
@@ -19,7 +77,11 @@ func TestAILive(t *testing.T) {
 	if mdl == "" {
 		t.Skip("set DBVIEWER_OLLAMA_MODEL to run against a local Ollama")
 	}
+	realHome := os.Getenv("HOME")
 	c := testCore(t)
+	if realHome != "" {
+		t.Setenv("HOME", realHome)
+	}
 	ctx := context.Background()
 	ps := NewProjectService(c)
 	projects, _ := ps.Projects()
@@ -87,7 +149,11 @@ func TestAITasksLive(t *testing.T) {
 	if mdl == "" {
 		t.Skip("set DBVIEWER_OLLAMA_MODEL to run against a local Ollama")
 	}
+	realHome := os.Getenv("HOME")
 	c := testCore(t)
+	if realHome != "" {
+		t.Setenv("HOME", realHome)
+	}
 	ctx := context.Background()
 	projects, _ := NewProjectService(c).Projects()
 	saved, err := NewConnectionService(c).SaveConnection(model.ConnectionConfig{

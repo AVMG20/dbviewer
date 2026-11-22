@@ -1,16 +1,19 @@
 package model
 
-// AIModel is one model installed in the local Ollama server (AIService.Models).
+// AIModel is one available AI model (from Antigravity CLI or local Ollama).
 type AIModel struct {
 	Name          string `json:"name"`
+	Label         string `json:"label,omitempty"` // human-readable name (Antigravity CLI)
 	SizeBytes     int64  `json:"sizeBytes"`
 	ParameterSize string `json:"parameterSize"` // e.g. "4.0B", "" unknown
 	Family        string `json:"family"`
 }
 
-// AISettings says which Ollama server and model to use.
+// AISettings says which AI provider ("agy" or "ollama") and model to use.
 type AISettings struct {
-	// BaseURL of the Ollama server; "" = http://localhost:11434.
+	// Provider: "agy" (Antigravity CLI) or "ollama" (local Ollama; "" = "ollama").
+	Provider string `json:"provider"`
+	// BaseURL of the Ollama server (ollama only); "" = http://localhost:11434.
 	BaseURL string `json:"baseUrl"`
 	Model   string `json:"model"`
 	// KeepAlive: how long Ollama keeps the model loaded after a request

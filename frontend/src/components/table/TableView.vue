@@ -31,7 +31,7 @@ import RecordPanel from "./RecordPanel.vue";
 import NavMenu from "./NavMenu.vue";
 import { incomingForRow, loadLinks, navEntries, navigableColumns, type Links, type NavEntry } from "@/lib/fkNav";
 import SqlClauseInput from "./SqlClauseInput.vue";
-import { aiError, aiOffMessage, aiReady, filterTask, fmtDuration, release as releaseAi, warm as warmAi, type AiJob } from "@/lib/ai";
+import { aiError, aiOffMessage, aiReady, filterTask, fmtDuration, type AiJob } from "@/lib/ai";
 import type { AIFilterResult } from "@/api";
 
 const props = defineProps<{ tab: Tab; active: boolean }>();
@@ -327,7 +327,7 @@ watch(() => projects.statuses[connId.value]?.connected, (c, prev) => {
 // ---- AI filter (plain language -> WHERE / ORDER BY) ---------------------------------------
 const whereInput = ref<InstanceType<typeof SqlClauseInput> | null>(null);
 const aiFilterInput = ref<HTMLInputElement | null>(null);
-const aiAvailable = computed(() => settings.aiEnabled && !!settings.aiModel);
+const aiAvailable = computed(() => aiReady());
 const aiFilter = ref<{ open: boolean; text: string; busy: boolean; error: string; settings: boolean }>({ open: false, text: "", busy: false, error: "", settings: false });
 /** an AI suggestion is in the inputs (not applied yet): Esc in WHERE restores these */
 const aiSuggested = ref<{ where: string; orderBy: string; info: string } | null>(null);
@@ -340,7 +340,6 @@ async function openAiFilter() {
   await nextTick();
   aiFilterInput.value?.focus();
   aiFilterInput.value?.select();
-  void warmAi();
 }
 function closeAiFilter(focusWhere = true) {
   aiFilterJob?.cancel();
@@ -348,7 +347,6 @@ function closeAiFilter(focusWhere = true) {
   if (!aiFilter.value.open) return;
   aiFilter.value.open = false;
   aiFilter.value.busy = false;
-  releaseAi();
   if (focusWhere) nextTick(() => whereInput.value?.focus());
 }
 async function runAiFilter() {
@@ -356,7 +354,7 @@ async function runAiFilter() {
   if (!prompt || aiFilter.value.busy) return;
   aiFilter.value.busy = true;
   aiFilter.value.error = "";
-  const my = (aiFilterJob = filterTask({ connId: connId.value, schema: schema.value, table: table.value, prompt }, { session: true }));
+  const my = (aiFilterJob = filterTask({ connId: connId.value, schema: schema.value, table: table.value, prompt }));
   try {
     const res = await my.promise;
     if (aiFilterJob !== my) return;

@@ -20,7 +20,7 @@
 - **Jump anywhere** with Cmd/Ctrl+K: tables, columns (`orders total`), connections, saved queries and recent tables
 - **Filtering** with raw SQL `WHERE` / `ORDER BY` (highlighting and completion), quick find, per-column filters
 - **SQL console** with schema-aware autocomplete, formatting, export, history, saved queries and EXPLAIN; asks before UPDATE/DELETE without WHERE and before writes on red (production) connections
-- **Local AI** through [Ollama](https://ollama.com) (optional, Settings → AI): Cmd/Ctrl+\ writes or changes SQL inline, fix failed queries, plain-language table filters, explain a query or its EXPLAIN plan, convert between dialects, and inline suggestions while you type. Ollama gets your prompt and the relevant table and column names; the table filter also sends the distinct values of short status-like columns
+- **AI** through the Antigravity CLI (`agy`) and optional local [Ollama](https://ollama.com) (Settings → AI): Cmd/Ctrl+\ writes or changes SQL inline, fix failed queries, plain-language table filters, explain a query or its EXPLAIN plan, and convert between dialects via Antigravity CLI; local Ollama powers fast console tab naming and inline ghost-text suggestions while you type
 - **Selection totals**: count, sum, average, min and max of the selected cells in the status bar
 - **Foreign keys**: Cmd/Ctrl-click a value to open the referenced row; mouse back/forward to return
 - **Copy as** TSV, CSV, JSON, SQL INSERT or Markdown; paste TSV/CSV from a spreadsheet

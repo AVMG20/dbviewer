@@ -1,92 +1,110 @@
-// Local AI (Ollama) helpers shared by every AI feature: settings → request payload, model
-// list, warm/release of the model, streaming SQL generation, error texts and the prompt history.
-//
-//   if (!aiReady()) return aiOffToast(ui);
-//   const job = generateSql({ connId, schema, prompt, sql, context }, (c) => preview(c.sql), { session: true });
-//   const res = await job.promise;   // rejects with {code: "canceled"} after job.cancel()
-//
-// Sessions: an interactive feature (the inline prompt) keeps the model loaded while it is open
-// (warm() + generateSql(..., {session: true})) and calls release() when it closes; release()
-// unloads the model only when the user chose "Unload right away" (aiKeepAlive "0").
+// AI helpers shared by every AI feature:
+// - Antigravity CLI (`agy`): writing/changing SQL (Cmd+\), fixing errors, dialect conversion,
+//   explaining queries & EXPLAIN plans, plain-language table filters.
+// - Local Ollama: fast console tab naming, save-query name suggestions, and inline ghost-text
+//   autocomplete while typing (tab naming falls back to Antigravity CLI if Ollama is off).
 import type { CancellablePromise } from "@wailsio/runtime";
 import {
   aiApi, apiError, newId, onAiChunk,
-  type AIChunk, type AICompleteResult, type AIFilterResult, type AIModel, type AISettings, type AISQLRequest, type AISQLResult, type AITaskRequest, type AITextResult, type ApiError,
+  type AIChunk, type AICompleteResult, type AIFilterResult, type AIModel, type AISettings, type AISQLRequest, type AISQLResult, type AITaskRequest, type AITextResult,
 } from "@/api";
-import { settings } from "@/lib/settings";
+import { DEFAULT_AI_MODEL, settings } from "@/lib/settings";
 import { kbd } from "@/lib/kbd";
 
-/** AI is switched on and a model is chosen. */
+/** Antigravity CLI AI is enabled (main AI features: generate, fix, explain, convert, filter). */
 export function aiReady(): boolean {
-  return settings.aiEnabled && !!settings.aiModel;
+  return settings.aiEnabled && !!(settings.aiModel || DEFAULT_AI_MODEL);
 }
 
-/** Inline suggestions (ghost text) in the SQL console are on and AI is ready. */
+/** Local Ollama is switched on and a model is chosen (tab naming & inline autocomplete). */
+export function ollamaReady(): boolean {
+  return settings.ollamaEnabled && !!settings.ollamaModel;
+}
+
+/** Tab / query naming is available (prefers local Ollama, falls back to Antigravity CLI). */
+export function aiNameReady(): boolean {
+  return ollamaReady() || aiReady();
+}
+
+/** Inline suggestions (ghost text) in the SQL console are on and local Ollama is ready. */
 export function aiInlineReady(): boolean {
-  return aiReady() && settings.aiInline;
+  return ollamaReady() && settings.aiInline;
 }
 
-/** Shown when an AI shortcut is used while AI is off. */
+/** Shown when an AI shortcut is used while Antigravity CLI AI is off. */
 export function aiOffMessage(): string {
-  return settings.aiEnabled
-    ? kbd("Choose an AI model in Settings (⌘,) first.")
-    : kbd("AI is off. Turn it on in Settings (⌘,) → AI.");
+  return kbd("AI is off. Turn on Antigravity CLI in Settings (⌘,) → AI.");
 }
 
-/** Keep-alive used while an interactive session is open: never shorter than 2 minutes. */
+/** Keep-alive used while an interactive Ollama session is open: never shorter than 2 minutes. */
 const SESSION_KEEP_ALIVE = "2m";
 
-/** The Ollama settings sent with every call. */
-export function aiSettings(session = false): AISettings {
-  const keep = settings.aiKeepAlive;
+/** Antigravity CLI settings sent with main AI calls. */
+export function agySettings(): AISettings {
   return {
-    baseUrl: settings.aiUrl,
-    model: settings.aiModel,
+    provider: "agy",
+    baseUrl: "",
+    model: settings.aiModel || DEFAULT_AI_MODEL,
+    keepAlive: "",
+  };
+}
+
+/** Local Ollama settings sent with Ollama-backed calls (tab naming & inline autocomplete). */
+export function ollamaSettings(session = false): AISettings {
+  const keep = settings.ollamaKeepAlive;
+  return {
+    provider: "ollama",
+    baseUrl: settings.ollamaUrl,
+    model: settings.ollamaModel,
     keepAlive: session && keep === "0" ? SESSION_KEEP_ALIVE : keep,
   };
 }
 
-/** Installed models, sorted by name. Rejects (not_connected) when Ollama is not running. */
-export async function listModels(baseUrl = settings.aiUrl): Promise<AIModel[]> {
+/** Settings used for NameQuery: local Ollama when configured, otherwise Antigravity CLI. */
+function nameSettings(): AISettings {
+  return ollamaReady() ? ollamaSettings(false) : agySettings();
+}
+
+/** Models available through the Antigravity CLI (`agy models`). */
+export async function listAgyModels(): Promise<AIModel[]> {
+  return await aiApi.AgyModels();
+}
+
+/** Models installed in local Ollama. Rejects (not_connected) when Ollama is not running. */
+export async function listOllamaModels(baseUrl = settings.ollamaUrl): Promise<AIModel[]> {
   return await aiApi.Models(baseUrl);
 }
 
-/** Picks a sensible default model: prefers instruct / coder models (fast, follow the format). */
-export function pickDefaultModel(models: AIModel[]): string {
+/** Picks the default Antigravity CLI model (prefers Hydrogen). */
+export function pickDefaultAgyModel(models: AIModel[]): string {
+  if (models.some((m) => m.name === DEFAULT_AI_MODEL)) return DEFAULT_AI_MODEL;
+  return (
+    models.find((m) => /hydrogen/i.test(m.name) || /hydrogen/i.test(m.label ?? ""))?.name ??
+    models[0]?.name ??
+    DEFAULT_AI_MODEL
+  );
+}
+
+/** Picks a sensible default Ollama model: prefers instruct / coder models (fast, follow the format). */
+export function pickDefaultOllamaModel(models: AIModel[]): string {
   const names = models.map((m) => m.name);
   return names.find((n) => /instruct/i.test(n)) ?? names.find((n) => /coder/i.test(n)) ?? names[0] ?? "";
 }
 
-/** Loads the model in the background. Resolves with the error (or null), never rejects. */
-export async function warm(): Promise<ApiError | null> {
-  if (!aiReady()) return null;
-  try {
-    await aiApi.Warm(aiSettings(true));
-    return null;
-  } catch (e) {
-    return apiError(e);
-  }
-}
-
-/** Ends an interactive session: unloads the model when the user wants it unloaded right away. */
-export function release(): void {
-  if (settings.aiModel && settings.aiKeepAlive === "0") aiApi.Unload(aiSettings()).catch(() => undefined);
-}
-
-// ---- inline suggestions ----------------------------------------------------------------
-/** The model for inline suggestions: its own setting, else the main model. */
+// ---- inline suggestions (local Ollama) -------------------------------------------------
+/** The Ollama model for inline suggestions: its own setting, else the Ollama model. */
 export function inlineModel(): string {
-  return settings.aiInlineModel || settings.aiModel;
+  return settings.aiInlineModel || settings.ollamaModel;
 }
 
 function inlineSettings(): AISettings {
-  return { ...aiSettings(true), model: inlineModel() };
+  return { ...ollamaSettings(true), model: inlineModel() };
 }
 
 let inlineWarmAt = 0;
 let inlineWarmModel = "";
 
-/** Loads the suggestion model in the background (at most once a minute per model). */
+/** Loads the Ollama suggestion model in the background (at most once a minute per model). */
 export function warmInline(): void {
   if (!aiInlineReady()) return;
   const m = inlineModel();
@@ -102,7 +120,7 @@ export function completeSql(input: { connId: string; schema: string; before: str
   return { promise: p, cancel: () => p.cancel() };
 }
 
-export type SqlInput = Omit<AISQLRequest, "requestId" | "baseUrl" | "model" | "keepAlive" | "retry" | "context" | "sql"> & {
+export type SqlInput = Omit<AISQLRequest, "requestId" | "provider" | "baseUrl" | "model" | "keepAlive" | "retry" | "context" | "sql"> & {
   sql?: string;
   context?: string;
   retry?: boolean;
@@ -138,14 +156,14 @@ function streamJob<T>(call: (requestId: string) => CancellablePromise<T>, onChun
 }
 
 /**
- * Writes (input.sql empty) or changes (input.sql set) one SQL statement. onChunk gets the whole
- * SQL so far while the model writes (chunk.thinking: still reasoning, no SQL yet).
+ * Writes (input.sql empty) or changes (input.sql set) one SQL statement via Antigravity CLI.
+ * onChunk gets the whole SQL so far while the model writes.
  */
-export function generateSql(input: SqlInput, onChunk?: (c: AIChunk) => void, opts: { session?: boolean } = {}): AiJob {
+export function generateSql(input: SqlInput, onChunk?: (c: AIChunk) => void): AiJob {
   return streamJob(
     (requestId) =>
       aiApi.GenerateSQL({
-        ...aiSettings(!!opts.session),
+        ...agySettings(),
         requestId,
         connId: input.connId,
         schema: input.schema,
@@ -158,11 +176,11 @@ export function generateSql(input: SqlInput, onChunk?: (c: AIChunk) => void, opt
   );
 }
 
-export type TaskInput = Partial<Omit<AITaskRequest, "requestId" | "baseUrl" | "model" | "keepAlive">> & { connId: string };
+export type TaskInput = Partial<Omit<AITaskRequest, "requestId" | "provider" | "baseUrl" | "model" | "keepAlive">> & { connId: string };
 
-function taskRequest(input: TaskInput, requestId: string, session: boolean): AITaskRequest {
+function taskRequest(input: TaskInput, requestId: string, cfg: AISettings): AITaskRequest {
   return {
-    ...aiSettings(session),
+    ...cfg,
     requestId,
     connId: input.connId,
     schema: input.schema ?? "",
@@ -179,26 +197,30 @@ function taskRequest(input: TaskInput, requestId: string, session: boolean): AIT
 type SqlTask = "FixSQL" | "ConvertSQL";
 type TextTask = "ExplainSQL" | "ExplainPlan" | "NameQuery";
 
-/** FixSQL / ConvertSQL: streams SQL like generateSql. */
-export function sqlTask(task: SqlTask, input: TaskInput, onChunk?: (c: AIChunk) => void, opts: { session?: boolean } = {}): AiJob {
-  return streamJob((id) => aiApi[task](taskRequest(input, id, !!opts.session)), onChunk);
+/** FixSQL / ConvertSQL via Antigravity CLI: streams SQL like generateSql. */
+export function sqlTask(task: SqlTask, input: TaskInput, onChunk?: (c: AIChunk) => void): AiJob {
+  return streamJob((id) => aiApi[task](taskRequest(input, id, agySettings())), onChunk);
 }
 
-/** ExplainSQL / ExplainPlan (streamed: chunk.text) and NameQuery (not streamed). */
-export function textTask(task: TextTask, input: TaskInput, onChunk?: (c: AIChunk) => void, opts: { session?: boolean } = {}): AiJob<AITextResult> {
-  return streamJob((id) => aiApi[task](taskRequest(input, id, !!opts.session)), onChunk);
+/** ExplainSQL / ExplainPlan (Antigravity CLI, streamed) and NameQuery (Ollama preferred, fallback Antigravity CLI). */
+export function textTask(task: TextTask, input: TaskInput, onChunk?: (c: AIChunk) => void): AiJob<AITextResult> {
+  const cfg = task === "NameQuery" ? nameSettings() : agySettings();
+  return streamJob((id) => aiApi[task](taskRequest(input, id, cfg)), onChunk);
 }
 
-/** WHERE (+ ORDER BY) for one table from a plain-language request. */
-export function filterTask(input: TaskInput, opts: { session?: boolean } = {}): AiJob<AIFilterResult> {
-  return streamJob((id) => aiApi.FilterRows(taskRequest(input, id, !!opts.session)));
+/** WHERE (+ ORDER BY) for one table from a plain-language request via Antigravity CLI. */
+export function filterTask(input: TaskInput): AiJob<AIFilterResult> {
+  return streamJob((id) => aiApi.FilterRows(taskRequest(input, id, agySettings())));
 }
 
 /** A failed AI call for display: the message and whether the fix is in Settings. */
 export function aiError(e: unknown): { message: string; settings: boolean } | null {
   const err = apiError(e);
   if (err.code === "canceled") return null;
-  const settingsFix = err.code === "not_connected" || err.code === "not_found" || (err.code === "invalid_argument" && /model|ollama url/i.test(err.message));
+  const settingsFix =
+    err.code === "not_connected" ||
+    err.code === "not_found" ||
+    (err.code === "invalid_argument" && /model|ollama url|antigravity/i.test(err.message));
   return { message: err.message || err.code, settings: settingsFix };
 }
 

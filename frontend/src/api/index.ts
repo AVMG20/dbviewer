@@ -142,16 +142,11 @@ export const dataApi = {
   FetchPage: dataRaw.FetchPage as (req: PageRequest) => CancellablePromise<QueryResult>,
 };
 /**
- * Local AI (Ollama): Models(baseUrl) rejects with not_connected when Ollama is not running;
- * Warm(settings) preloads the model; Unload(settings) frees it; GenerateSQL(req) streams
- * "ai:chunk" events (onAiChunk) and resolves with the final statement; cancel the promise
- * to stop it. A missing model rejects with not_found.
- * Tasks (AITaskRequest; each uses the fields it needs): FixSQL (sql + error), ConvertSQL (sql +
- * target) stream SQL like GenerateSQL; ExplainSQL (sql) and ExplainPlan (sql + plan as TSV) stream
- * text (chunk.text); NameQuery (sql) and FilterRows (table + prompt; reads the distinct values of
- * status-like columns read-only) are not streamed.
- * CompleteSQL(req: AICompleteRequest {before, after}) suggests the text at the cursor of the SQL
- * console (inline ghost text, "" = none); not streamed, cancel the promise when the editor changes.
+ * AI service: supports both Antigravity CLI (`provider: "agy"`) and local Ollama (`provider: "ollama"`).
+ * AgyModels() lists Antigravity CLI models (`agy models`); Models(baseUrl) lists local Ollama models.
+ * Warm(settings) / Unload(settings) manage local Ollama model memory (no-op for Antigravity CLI).
+ * GenerateSQL(req), FixSQL, ConvertSQL stream "ai:chunk" SQL events; ExplainSQL and ExplainPlan
+ * stream text events; NameQuery and FilterRows are non-streamed. CompleteSQL suggests inline ghost text.
  */
 export const aiApi = AIService as unknown as CleanService<typeof AIService>;
 export const runQuery = QueryService.RunQuery as unknown as (req: QueryRequest) => CancellablePromise<QueryResult[]>;

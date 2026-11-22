@@ -23,7 +23,7 @@ func init() {
 	application.RegisterEvent[model.AIChunk](EventAIChunk)
 }
 
-// AIService writes SQL with a local model through Ollama.
+// AIService runs AI features through the Antigravity CLI (`agy`) and local Ollama.
 type AIService struct {
 	c *Core
 
@@ -32,6 +32,16 @@ type AIService struct {
 }
 
 func NewAIService(c *Core) *AIService { return &AIService{c: c, caps: map[string][]string{}} }
+
+// AgyModels lists the models available through the Antigravity CLI (`agy models`).
+// Rejects with not_connected when `agy` is missing or fails.
+func (s *AIService) AgyModels(ctx context.Context) ([]model.AIModel, error) {
+	list, err := ai.NewAgyClient().Models(ctx)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	return ret(list, nil)
+}
 
 // Models lists the models installed in Ollama at baseURL ("" = localhost).
 // Rejects with not_connected when Ollama is not running.
@@ -48,11 +58,10 @@ func (s *AIService) Models(ctx context.Context, baseURL string) ([]model.AIModel
 	return ret(list, nil)
 }
 
-// Warm loads the model (the AI prompt calls it on open, so the model is ready by
-// the time the user has typed). It stays loaded for settings.KeepAlive, at least 2m.
-// Rejects like GenerateSQL when Ollama is not running or the model is missing.
+// Warm loads the local Ollama model so it is ready before the user sends a request.
+// No-op for Antigravity CLI.
 func (s *AIService) Warm(ctx context.Context, settings model.AISettings) error {
-	if settings.Model == "" {
+	if settings.Provider == ai.ProviderAgy || settings.Model == "" {
 		return nil
 	}
 	cl, err := ai.NewClient(settings.BaseURL)
@@ -68,9 +77,9 @@ func (s *AIService) Warm(ctx context.Context, settings model.AISettings) error {
 	return wrap(cl.SetKeepAlive(ctx, settings.Model, keep))
 }
 
-// Unload frees the model's memory right away.
+// Unload frees the local Ollama model's memory right away. No-op for Antigravity CLI.
 func (s *AIService) Unload(ctx context.Context, settings model.AISettings) error {
-	if settings.Model == "" {
+	if settings.Provider == ai.ProviderAgy || settings.Model == "" {
 		return nil
 	}
 	cl, err := ai.NewClient(settings.BaseURL)
@@ -150,15 +159,26 @@ func (s *AIService) generateSQL(ctx context.Context, req model.AISQLRequest) (mo
 		SQL:         sql,
 		Tables:      names,
 		TotalTables: len(infos),
-		Model:       req.Model,
+		Model:       effectiveModel(req.AISettings),
 		DurationMs:  time.Since(start).Milliseconds(),
 		LoadMs:      stats.LoadDuration.Milliseconds(),
 	}, nil
 }
 
+func effectiveModel(set model.AISettings) string {
+	m := strings.TrimSpace(set.Model)
+	if set.Provider == ai.ProviderAgy && m == "" {
+		return ai.DefaultAgyModel
+	}
+	return m
+}
+
 func checkModel(set model.AISettings) error {
-	if set.Model == "" {
-		return model.Errf(model.ErrInvalid, "no model selected: pick one in Settings (AI)")
+	if set.Provider == ai.ProviderAgy {
+		return nil
+	}
+	if strings.TrimSpace(set.Model) == "" {
+		return model.Errf(model.ErrInvalid, "no Ollama model selected: pick one in Settings (AI)")
 	}
 	return nil
 }
@@ -188,10 +208,15 @@ func referenced(sql string, infos []ai.TableInfo) []*ai.TableInfo {
 	return out
 }
 
-// chat runs one chat completion with the settings' model; onContent gets the reply so far.
+// chat runs one chat completion with the settings' provider and model; onContent gets the reply so far.
 func (s *AIService) chat(ctx context.Context, set model.AISettings, msgs []ai.Message, retry bool, onContent func(content string, thinking bool)) (string, ai.ChatStats, error) {
 	if err := checkModel(set); err != nil {
 		return "", ai.ChatStats{}, err
+	}
+	mdl := effectiveModel(set)
+	if set.Provider == ai.ProviderAgy {
+		reply, err := ai.NewAgyClient().Chat(ctx, mdl, msgs, retry, onContent)
+		return reply, ai.ChatStats{}, wrap(err)
 	}
 	cl, err := ai.NewClient(set.BaseURL)
 	if err != nil {
@@ -201,8 +226,8 @@ func (s *AIService) chat(ctx context.Context, set model.AISettings, msgs []ai.Me
 	if retry {
 		temp = 0.8
 	}
-	chat := ai.ChatRequest{Model: set.Model, Messages: msgs, KeepAlive: set.KeepAlive, Options: ai.Options(temp)}
-	if s.supportsThink(ctx, cl, set.Model) {
+	chat := ai.ChatRequest{Model: mdl, Messages: msgs, KeepAlive: set.KeepAlive, Options: ai.Options(temp)}
+	if s.supportsThink(ctx, cl, mdl) {
 		off := false
 		chat.Think = &off
 	}
@@ -286,7 +311,7 @@ func (s *AIService) fixSQL(ctx context.Context, req model.AITaskRequest) (model.
 	if err != nil {
 		return model.AISQLResult{}, err
 	}
-	return model.AISQLResult{SQL: sql, Tables: names, TotalTables: len(infos), Model: req.Model, DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
+	return model.AISQLResult{SQL: sql, Tables: names, TotalTables: len(infos), Model: effectiveModel(req.AISettings), DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
 }
 
 // ConvertSQL rewrites req.SQL (written for the connection's database) for the
@@ -314,7 +339,7 @@ func (s *AIService) convertSQL(ctx context.Context, req model.AITaskRequest) (mo
 	if err != nil {
 		return model.AISQLResult{}, err
 	}
-	return model.AISQLResult{SQL: sql, Model: req.Model, DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
+	return model.AISQLResult{SQL: sql, Model: effectiveModel(req.AISettings), DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
 }
 
 // driverOf returns the driver name of a saved connection (without connecting).
@@ -353,7 +378,7 @@ func (s *AIService) explainSQL(ctx context.Context, req model.AITaskRequest) (mo
 	if err != nil {
 		return model.AITextResult{}, err
 	}
-	return model.AITextResult{Text: text, Tables: names, Model: req.Model, DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
+	return model.AITextResult{Text: text, Tables: names, Model: effectiveModel(req.AISettings), DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
 }
 
 // ExplainPlan reviews an EXPLAIN result (req.Plan, tab-separated with a header
@@ -406,7 +431,7 @@ func (s *AIService) explainPlan(ctx context.Context, req model.AITaskRequest) (m
 	if err != nil {
 		return model.AITextResult{}, err
 	}
-	return model.AITextResult{Text: text, Tables: names, Model: req.Model, DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
+	return model.AITextResult{Text: text, Tables: names, Model: effectiveModel(req.AISettings), DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil
 }
 
 // NameQuery suggests a short title (2–5 words) for req.SQL, e.g. "Paid orders per
@@ -424,7 +449,7 @@ func (s *AIService) NameQuery(ctx context.Context, req model.AITaskRequest) (mod
 	if title == "" {
 		return ret(model.AITextResult{}, model.Errf(model.ErrInternal, "the model returned no name"))
 	}
-	return ret(model.AITextResult{Text: title, Model: req.Model, DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil)
+	return ret(model.AITextResult{Text: title, Model: effectiveModel(req.AISettings), DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds()}, nil)
 }
 
 // FilterRows turns a plain-language request (req.Prompt) into a WHERE condition
@@ -475,7 +500,7 @@ func (s *AIService) filterRows(ctx context.Context, req model.AITaskRequest) (mo
 		return model.AIFilterResult{}, model.Errf(model.ErrInternal, "%s", err.Error())
 	}
 	return model.AIFilterResult{
-		Where: where, OrderBy: orderBy, Values: values, Model: req.Model,
+		Where: where, OrderBy: orderBy, Values: values, Model: effectiveModel(req.AISettings),
 		DurationMs: time.Since(start).Milliseconds(), LoadMs: stats.LoadDuration.Milliseconds(),
 	}, nil
 }

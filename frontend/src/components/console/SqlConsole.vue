@@ -37,7 +37,7 @@ import SqlEditor, { type SchemaTable } from "./SqlEditor.vue";
 import AiPrompt, { type AiMode, type AiTarget, type AiTask } from "./AiPrompt.vue";
 import AiAnswer, { type AiAnswerRequest } from "./AiAnswer.vue";
 import { discardInline, endInline, getInline, retargetInline, startInline } from "./aiInline";
-import { aiError, aiInlineReady, aiOffMessage, aiReady, completeSql, inlineModel, release as releaseAi, sqlTask, textTask, warmInline, type AiJob } from "@/lib/ai";
+import { aiError, aiInlineReady, aiNameReady, aiOffMessage, aiReady, completeSql, inlineModel, sqlTask, textTask, warmInline, type AiJob } from "@/lib/ai";
 import type { GhostOptions } from "./aiGhost";
 import { cellText } from "@/lib/format";
 import type { AITextResult } from "@/api";
@@ -244,9 +244,11 @@ async function prepareAndRun(sql: string, offset: number) {
     const rs = await p;
     lastMs.value = Math.round(performance.now() - t0);
     setResults(rs, offset, undefined, stmts);
-    // name the console after what it queries (kept when the user renamed the tab)
-    const table = stmts.find((s) => s.table)?.table;
-    if (table && rs.some((r) => !r.error)) aiTitle(sql, table);
+    // name the console once after the first successful query (kept when the user renamed the tab)
+    if (rs.some((r) => !r.error)) {
+      const table = stmts.find((s) => s.table)?.table ?? "";
+      aiTitle(sql, table);
+    }
     const first = rs.find((r) => r.hasResultSet) ?? rs[rs.length - 1];
     const dur = rs.reduce((n, r) => n + (r.durationMs || 0), 0);
     const wasCanceled = userCanceled || rs.some((r) => r.error.startsWith("canceled"));
@@ -403,7 +405,7 @@ async function startSave() {
   saveName.value = "";
   await nextTick();
   saveInput.value?.focus();
-  if (aiReady()) void suggestName(st.selected.trim() ? st.selected : st.doc);
+  if (aiNameReady()) void suggestName(st.selected.trim() ? st.selected : st.doc);
 }
 async function suggestName(sql: string) {
   nameJob?.cancel();
@@ -543,7 +545,7 @@ async function formatEditor() {
 }
 
 // ---- AI (⌘\) ------------------------------------------------------------------------------------------------
-const aiAvailable = computed(() => settings.aiEnabled && !!settings.aiModel);
+const aiAvailable = computed(() => aiReady());
 /** widget element of the open prompt (Teleport target), null = closed */
 const aiEl = shallowRef<HTMLElement | null>(null);
 const aiView = shallowRef<EditorView | null>(null);
@@ -648,7 +650,6 @@ function closeAi(opts: { restore?: boolean; focus?: boolean } = {}) {
   aiTarget.value = null;
   aiTask.value = null;
   aiTargets = {};
-  releaseAi();
   if (opts.focus !== false && props.active) editor.value?.focus();
 }
 
@@ -719,7 +720,7 @@ async function fixWithAi(r: ResTab | null = activeResult.value) {
   const task: AiTask = {
     label: "Fix",
     doing: "Fixing the query",
-    start: (onChunk, retry) => sqlTask("FixSQL", { connId: connId.value, schema: schema.value, sql: range.sql, error, retry }, onChunk, { session: true }),
+    start: (onChunk, retry) => sqlTask("FixSQL", { connId: connId.value, schema: schema.value, sql: range.sql, error, retry }, onChunk),
   };
   await openAi({ target: { mode: "change", from: range.from, to: range.to, side: -1, prefix: "", suffix: "" }, task });
 }
@@ -750,7 +751,7 @@ async function convertWithAi(target: Driver) {
   const task: AiTask = {
     label: `→ ${label}`,
     doing: `Converting to ${label}`,
-    start: (onChunk, retry) => sqlTask("ConvertSQL", { connId: connId.value, sql: r.sql, target, retry }, onChunk, { session: true }),
+    start: (onChunk, retry) => sqlTask("ConvertSQL", { connId: connId.value, sql: r.sql, target, retry }, onChunk),
   };
   await openAi({ target: { mode: "change", from: r.from, to: r.to, side: -1, prefix: "", suffix: "" }, task });
 }
@@ -803,25 +804,26 @@ function aiMenuItems(): MenuItem[] {
 }
 
 /**
- * Names the tab after a successful run: a short AI title when AI is on (not when the model is
- * unloaded after every request: naming would load it on every run), else the first table.
+ * Names the console tab automatically once after the first successful query: uses AI
+ * (local Ollama when configured, else Antigravity CLI) or falls back to the first table.
+ * Subsequent runs leave the title alone; right-click the tab to "Rename with AI" again.
  */
-let titledSql = "";
 let titleJob: AiJob<AITextResult> | null = null;
 function aiTitle(sql: string, table: string) {
-  if (props.tab.customTitle) return;
-  if (!aiReady() || settings.aiKeepAlive === "0") return tabs.autoTitle(props.tab.id, table);
+  if (props.tab.customTitle || props.tab.aiNamed) return;
+  if (!aiNameReady()) {
+    if (table) tabs.autoTitle(props.tab.id, table);
+    return;
+  }
   const key = sql.trim().replace(EXPLAIN_RE, "");
-  if (key === titledSql) return;
-  titleJob?.cancel();
+  if (!key || titleJob) return;
   const my = (titleJob = textTask("NameQuery", { connId: connId.value, sql: key.slice(0, 4000) }));
   my.promise
     .then((res) => {
       if (titleJob !== my) return;
-      titledSql = key;
-      tabs.autoTitle(props.tab.id, res.text);
+      tabs.setAiTitle(props.tab.id, res.text);
     })
-    .catch(() => titleJob === my && tabs.autoTitle(props.tab.id, table))
+    .catch(() => titleJob === my && table && tabs.autoTitle(props.tab.id, table))
     .finally(() => titleJob === my && (titleJob = null));
 }
 
@@ -842,7 +844,7 @@ function startSplit(e: MouseEvent) {
 let saveTimer: number | undefined;
 watch(sqlText, (v) => {
   clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => tabs.update(props.tab.id, { sql: v }), 400);
+  saveTimer = window.setTimeout(() => tabs.update(props.tab.id, { sql: v }), 150);
 });
 watch(() => props.tab.sql, (v) => {
   if (v !== undefined && v !== sqlText.value) {
