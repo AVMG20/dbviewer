@@ -11,8 +11,7 @@ import (
 	"dbviewer/internal/model"
 )
 
-// Limits for the schema part of the prompt. Small local models are fast with a
-// short prompt and get confused by a long one, so only the relevant tables go in.
+// Default limits for small local models (Ollama): fast with a short prompt.
 const (
 	maxTables      = 8
 	maxColumns     = 40
@@ -29,6 +28,53 @@ const (
 	auxiliaryPenalty = 4.0
 	importanceWeight = 1.5 // per incoming foreign key (max 4)
 )
+
+// PickOptions controls how many tables and columns are sent in a prompt.
+type PickOptions struct {
+	MaxTables      int
+	MaxColumns     int
+	SchemaBudget   int
+	AllTablesBelow int
+	// ForceTables names tables (case-insensitive) that are always included first.
+	ForceTables []string
+}
+
+// DefaultPickOptions returns compact limits tuned for small local Ollama models.
+func DefaultPickOptions() PickOptions {
+	return PickOptions{
+		MaxTables:      maxTables,
+		MaxColumns:     maxColumns,
+		SchemaBudget:   schemaBudget,
+		AllTablesBelow: allTablesBelow,
+	}
+}
+
+// AgyPickOptions returns larger, still token-efficient limits for Antigravity CLI models.
+func AgyPickOptions() PickOptions {
+	return PickOptions{
+		MaxTables:      20,
+		MaxColumns:     50,
+		SchemaBudget:   28000,
+		AllTablesBelow: 40,
+	}
+}
+
+func (o PickOptions) normalized() PickOptions {
+	d := DefaultPickOptions()
+	if o.MaxTables <= 0 {
+		o.MaxTables = d.MaxTables
+	}
+	if o.MaxColumns <= 0 {
+		o.MaxColumns = d.MaxColumns
+	}
+	if o.SchemaBudget <= 0 {
+		o.SchemaBudget = d.SchemaBudget
+	}
+	if o.AllTablesBelow <= 0 {
+		o.AllTablesBelow = d.AllTablesBelow
+	}
+	return o
+}
 
 var stopWords = toSet(`a an the of for with without by in on at to from and or not no me my our we i you
 get give show list find fetch return select query make write all any every each per their its it them
@@ -115,6 +161,34 @@ func promptWords(prompt string) (words []string, raw map[string]bool) {
 	return words, raw
 }
 
+// PromptKeywords returns deduplicated, meaningful lowercase words (both raw and stemmed)
+// from a user prompt, skipping common SQL/English stop words. Used for dynamic metadata lookup.
+func PromptKeywords(prompt string) []string {
+	words, raw := promptWords(prompt)
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if len(s) < 3 || stopWords[s] || seen[s] {
+			return
+		}
+		if strings.Trim(s, "0123456789") == "" {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	// Prefer exact raw tokens first (e.g. "showrooms", "custom_code"), then stems ("showroom").
+	for _, tok := range wordRe.FindAllString(strings.ToLower(prompt), -1) {
+		if raw[tok] {
+			add(tok)
+		}
+	}
+	for _, w := range words {
+		add(w)
+	}
+	return out
+}
+
 func nameParts(name string) []string {
 	parts := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool { return r == '_' || r == '-' || r == ' ' || r == '.' })
 	for i, p := range parts {
@@ -152,15 +226,22 @@ type scored struct {
 	score float64
 }
 
-// PickTables selects the tables most relevant to the prompt: tables named in the
-// prompt or in the query being changed first, then tables whose names (and to a
-// lesser degree columns) match the prompt's words, then the tables those
-// reference through foreign keys.
+// PickTables selects the tables most relevant to the prompt using DefaultPickOptions.
 func PickTables(prompt, sql, editorContext string, tables []TableInfo) []*TableInfo {
+	return PickTablesWith(prompt, sql, editorContext, tables, DefaultPickOptions())
+}
+
+// PickTablesWith selects the tables most relevant to the prompt: forced tables and
+// tables named in the prompt or in the query being changed first, then tables whose
+// names or columns match the prompt's words, then bidirectional FK neighbors (both
+// parent and child tables, plus 2nd-hop parent references such as EAV attribute tables)
+// and non-auxiliary prefix siblings (e.g. catalog_product_entity_*).
+func PickTablesWith(prompt, sql, editorContext string, tables []TableInfo, opts PickOptions) []*TableInfo {
+	opts = opts.normalized()
 	if len(tables) == 0 {
 		return nil
 	}
-	if len(tables) <= allTablesBelow {
+	if len(tables) <= opts.AllTablesBelow {
 		out := make([]*TableInfo, len(tables))
 		for i := range tables {
 			out[i] = &tables[i]
@@ -172,20 +253,51 @@ func PickTables(prompt, sql, editorContext string, tables []TableInfo) []*TableI
 	inContext := ReferencedTables(editorContext)
 	byName := map[string]*TableInfo{}
 	// main entities (sales_order, customer_entity, catalog_product_entity) are the
-	// targets of many foreign keys; helper and junk tables of none
+	// targets of many foreign keys; helper and junk tables of none.
 	inbound := map[string]int{}
+	children := map[string][]*TableInfo{}
+	childSeen := map[string]bool{}
 	for i := range tables {
-		for _, c := range tables[i].Columns {
-			if c.FK != nil && !strings.EqualFold(c.FK.Table, tables[i].Name) {
-				inbound[strings.ToLower(c.FK.Table)]++
+		t := &tables[i]
+		lname := strings.ToLower(t.Name)
+		byName[lname] = t
+		for _, c := range t.Columns {
+			if c.FK != nil && !strings.EqualFold(c.FK.Table, t.Name) {
+				target := strings.ToLower(c.FK.Table)
+				inbound[target]++
+				edge := target + "\x00" + lname
+				if !childSeen[edge] {
+					childSeen[edge] = true
+					children[target] = append(children[target], t)
+				}
 			}
 		}
+	}
+	isAux := func(name string) bool {
+		for _, p := range nameParts(name) {
+			if auxiliaryWords[p] {
+				return true
+			}
+		}
+		return false
+	}
+	wordHitCount := func(t *TableInfo) int {
+		parts := nameParts(t.Name)
+		hits := 0
+		for _, w := range words {
+			for _, p := range parts {
+				if partMatch(w, p) {
+					hits++
+					break
+				}
+			}
+		}
+		return hits
 	}
 	var list []scored
 	for i := range tables {
 		t := &tables[i]
 		lname := strings.ToLower(t.Name)
-		byName[lname] = t
 		s := 0.0
 		if raw[lname] {
 			s += explicitMention
@@ -262,22 +374,33 @@ func PickTables(prompt, sql, editorContext string, tables []TableInfo) []*TableI
 	})
 	var out []*TableInfo
 	picked := map[string]bool{}
-	add := func(t *TableInfo) {
-		if t != nil && !picked[strings.ToLower(t.Name)] && len(out) < maxTables {
+	add := func(t *TableInfo) bool {
+		if t != nil && !picked[strings.ToLower(t.Name)] && len(out) < opts.MaxTables {
 			picked[strings.ToLower(t.Name)] = true
 			out = append(out, t)
+			return true
 		}
+		return false
 	}
-	// keep room for the tables the best matches join to
-	primary := maxTables - 2
+	// 1. Forced tables (e.g. from EAV metadata lookup or NEED_TABLES retry) always go first.
+	for _, fn := range opts.ForceTables {
+		add(byName[strings.ToLower(strings.TrimSpace(fn))])
+	}
+	// 2. Primary scored matches (keep room for FK / child / sibling expansion).
+	reserve := max(2, min(8, opts.MaxTables*2/5))
+	primaryLimit := max(1, opts.MaxTables-reserve)
+	var primaries []*TableInfo
 	for _, s := range list {
-		if len(out) >= primary {
+		if len(out) >= primaryLimit {
 			break
 		}
-		add(s.t)
+		if add(s.t) {
+			primaries = append(primaries, s.t)
+		}
 	}
+	// 3. Outbound FKs of already-picked tables (parent lookups).
 	for _, t := range append([]*TableInfo(nil), out...) {
-		if len(out) >= maxTables {
+		if len(out) >= opts.MaxTables {
 			break
 		}
 		for _, c := range t.Columns {
@@ -286,6 +409,118 @@ func PickTables(prompt, sql, editorContext string, tables []TableInfo) []*TableI
 			}
 		}
 	}
+	// 4. Inbound FK children of top primary tables (e.g. catalog_product_entity_varchar ->
+	// catalog_product_entity, sales_order_item -> sales_order). Prioritize prefix siblings,
+	// prompt-word matches, and non-auxiliary tables; cap per parent so hubs don't flood.
+	expandRoots := primaries
+	if len(expandRoots) > 4 {
+		expandRoots = expandRoots[:4]
+	}
+	var addedChildren []*TableInfo
+	perParent := 3
+	if opts.MaxTables >= 16 {
+		perParent = 6
+	}
+	for _, root := range expandRoots {
+		if len(out) >= opts.MaxTables {
+			break
+		}
+		rname := strings.ToLower(root.Name)
+		prefix := rname + "_"
+		kids := append([]*TableInfo(nil), children[rname]...)
+		if len(kids) > 0 {
+			sort.SliceStable(kids, func(i, j int) bool {
+				li, lj := strings.ToLower(kids[i].Name), strings.ToLower(kids[j].Name)
+				ai, aj := isAux(li), isAux(lj)
+				if ai != aj {
+					return !ai
+				}
+				pi, pj := strings.HasPrefix(li, prefix), strings.HasPrefix(lj, prefix)
+				if pi != pj {
+					return pi
+				}
+				hi, hj := wordHitCount(kids[i]), wordHitCount(kids[j])
+				if hi != hj {
+					return hi > hj
+				}
+				if kids[i].Rows != kids[j].Rows {
+					return kids[i].Rows > kids[j].Rows
+				}
+				return len(li) < len(lj)
+			})
+			n := 0
+			for _, k := range kids {
+				if n >= perParent || len(out) >= opts.MaxTables {
+					break
+				}
+				if isAux(k.Name) && wordHitCount(k) == 0 {
+					continue
+				}
+				// For huge hub tables (like `store`), only pull direct prefix siblings or word matches.
+				if inbound[rname] > 20 && !strings.HasPrefix(strings.ToLower(k.Name), prefix) && wordHitCount(k) == 0 {
+					continue
+				}
+				if add(k) {
+					addedChildren = append(addedChildren, k)
+					n++
+				}
+			}
+		}
+	}
+	// 5. 2nd-hop outbound FKs from added children (e.g. catalog_product_entity_varchar.attribute_id ->
+	// eav_attribute -> eav_entity_type).
+	for _, ch := range addedChildren {
+		if len(out) >= opts.MaxTables {
+			break
+		}
+		for _, c := range ch.Columns {
+			if c.FK != nil {
+				parent := byName[strings.ToLower(c.FK.Table)]
+				if add(parent) && parent != nil {
+					for _, pc := range parent.Columns {
+						if pc.FK != nil {
+							add(byName[strings.ToLower(pc.FK.Table)])
+						}
+					}
+				}
+			}
+		}
+	}
+	// 6. Prefix-sibling fallback for schemas without FK constraints (e.g. SQLite/MyISAM).
+	if opts.MaxTables >= 12 {
+		for _, root := range expandRoots {
+			if len(out) >= opts.MaxTables {
+				break
+			}
+			rname := strings.ToLower(root.Name)
+			if len(children[rname]) > 0 {
+				continue
+			}
+			prefix := rname + "_"
+			var sibs []*TableInfo
+			for i := range tables {
+				t := &tables[i]
+				lt := strings.ToLower(t.Name)
+				if strings.HasPrefix(lt, prefix) && !picked[lt] && !isAux(lt) {
+					sibs = append(sibs, t)
+				}
+			}
+			sort.SliceStable(sibs, func(i, j int) bool {
+				hi, hj := wordHitCount(sibs[i]), wordHitCount(sibs[j])
+				if hi != hj {
+					return hi > hj
+				}
+				if sibs[i].Rows != sibs[j].Rows {
+					return sibs[i].Rows > sibs[j].Rows
+				}
+				return len(sibs[i].Name) < len(sibs[j].Name)
+			})
+			for i := 0; i < len(sibs) && i < 5 && len(out) < opts.MaxTables; i++ {
+				add(sibs[i])
+			}
+		}
+	}
+	// 7. Fill remaining slots with next highest-scored tables.
 	for _, s := range list {
 		add(s.t)
 	}
@@ -340,17 +575,23 @@ func trimColumns(cols []model.Column, words []string, max int) ([]model.Column, 
 	return out, len(cols) - len(out)
 }
 
-// SchemaText renders the tables as compact pseudo-DDL, one line per table:
+// SchemaText renders the tables as compact pseudo-DDL using DefaultPickOptions.
+func SchemaText(tables []*TableInfo, prompt string) (string, []string) {
+	return SchemaTextWith(tables, prompt, DefaultPickOptions())
+}
+
+// SchemaTextWith renders the tables as compact pseudo-DDL within opts.SchemaBudget:
 //
 //	sales_order(entity_id int PK, customer_id int -> customer_entity.entity_id, …)
-func SchemaText(tables []*TableInfo, prompt string) (string, []string) {
+func SchemaTextWith(tables []*TableInfo, prompt string, opts PickOptions) (string, []string) {
+	opts = opts.normalized()
 	words, _ := promptWords(prompt)
 	var b strings.Builder
 	var names []string
 	for _, t := range tables {
-		cols, hidden := trimColumns(t.Columns, words, maxColumns)
+		cols, hidden := trimColumns(t.Columns, words, opts.MaxColumns)
 		line := tableLine(t, cols, hidden)
-		if b.Len()+len(line) > schemaBudget && len(names) > 0 {
+		if b.Len()+len(line) > opts.SchemaBudget && len(names) > 0 {
 			break
 		}
 		b.WriteString(line)
@@ -419,16 +660,34 @@ func dialectHints(driver string) string {
 	return ""
 }
 
+// PromptExtras adds optional metadata context and self-healing table lookup to MessagesWith.
+type PromptExtras struct {
+	// Metadata describes dynamic schema facts looked up read-only (e.g. Magento EAV attributes).
+	Metadata string
+	// AllowNeedTables instructs the model to reply with "NEED_TABLES: ..." if required
+	// tables are missing from a partial schema so the caller can fetch them and retry once.
+	AllowNeedTables bool
+}
+
 // Messages builds the chat messages for writing (sql == "") or changing a query.
 func Messages(driver, prompt, sql, schemaText string, totalTables, shownTables int, now time.Time) []Message {
+	return MessagesWith(driver, prompt, sql, schemaText, totalTables, shownTables, now, PromptExtras{})
+}
+
+// MessagesWith builds chat messages with optional dynamic metadata and NEED_TABLES fallback.
+func MessagesWith(driver, prompt, sql, schemaText string, totalTables, shownTables int, now time.Time, extras PromptExtras) []Message {
 	d := dialectName(driver)
+	var extraRule string
+	if extras.AllowNeedTables && totalTables > shownTables {
+		extraRule = "\n- If the query requires table(s) not listed in the schema above, do NOT invent tables or explain — reply with ONLY one line: NEED_TABLES: <comma-separated table names or prefixes>"
+	}
 	sys := fmt.Sprintf(`You write %s queries for a database tool. Rules:
 - Reply with exactly one SQL statement in a single `+"```sql"+` code block and nothing else: no explanation.
 - Use only the tables and columns listed in the schema. Never invent a table or column.
 - Join tables with explicit JOIN ... ON, using the references shown as "column -> table.column".
 - Give tables short aliases and qualify every column with its alias when the query has more than one table.
 - %s
-- Only write UPDATE, DELETE, INSERT or schema changes when the user explicitly asks for them.`, d, dialectHints(driver))
+- Only write UPDATE, DELETE, INSERT or schema changes when the user explicitly asks for them.%s`, d, dialectHints(driver), extraRule)
 
 	var u strings.Builder
 	u.WriteString("Schema")
@@ -441,6 +700,9 @@ func Messages(driver, prompt, sql, schemaText string, totalTables, shownTables i
 	} else {
 		u.WriteString(schemaText)
 	}
+	if meta := strings.TrimSpace(extras.Metadata); meta != "" {
+		u.WriteString("\nDatabase metadata:\n" + meta + "\n")
+	}
 	fmt.Fprintf(&u, "\nToday is %s.\n\n", now.Format("2006-01-02 (Monday)"))
 	if strings.TrimSpace(sql) == "" {
 		fmt.Fprintf(&u, "Write a query for: %s", strings.TrimSpace(prompt))
@@ -448,6 +710,113 @@ func Messages(driver, prompt, sql, schemaText string, totalTables, shownTables i
 		fmt.Fprintf(&u, "Current query:\n```sql\n%s\n```\n\nChange it: %s\nReturn the complete changed query.", strings.TrimSpace(sql), strings.TrimSpace(prompt))
 	}
 	return []Message{{Role: "system", Content: sys}, {Role: "user", Content: u.String()}}
+}
+
+var needTablesRe = regexp.MustCompile(`(?im)^\s*NEED_TABLES\s*:\s*(.+)$`)
+
+// ParseNeedTables extracts requested table names / prefixes from a NEED_TABLES reply.
+// Returns nil if the reply contains SQL or no NEED_TABLES directive.
+func ParseNeedTables(reply string) []string {
+	s := StripThinking(reply)
+	if strings.Contains(s, "```") {
+		return nil
+	}
+	m := needTablesRe.FindStringSubmatch(s)
+	if m == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range strings.FieldsFunc(m[1], func(r rune) bool { return r == ',' || r == ';' || r == '\n' }) {
+		t := strings.TrimSpace(part)
+		t = strings.Trim(t, "`\"'() ")
+		// strip placeholders like catalog_product_entity_<backend_type> or catalog_product_entity_*
+		if i := strings.IndexAny(t, "<*%{["); i >= 0 {
+			t = t[:i]
+		}
+		t = strings.TrimSpace(t)
+		low := strings.ToLower(t)
+		if len(low) < 2 || seen[low] {
+			continue
+		}
+		seen[low] = true
+		out = append(out, low)
+	}
+	return out
+}
+
+// ResolveRequestedTables matches model-requested table names / prefixes / keywords
+// against the full schema catalog and returns concrete table names (capped at max).
+func ResolveRequestedTables(terms []string, tables []TableInfo, max int) []string {
+	if len(terms) == 0 || len(tables) == 0 || max <= 0 {
+		return nil
+	}
+	byName := make(map[string]string, len(tables))
+	for i := range tables {
+		byName[strings.ToLower(tables[i].Name)] = tables[i].Name
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(name string) bool {
+		low := strings.ToLower(name)
+		if low == "" || seen[low] || len(out) >= max {
+			return false
+		}
+		seen[low] = true
+		out = append(out, name)
+		return true
+	}
+	isAux := func(name string) bool {
+		for _, p := range nameParts(name) {
+			if auxiliaryWords[p] {
+				return true
+			}
+		}
+		return false
+	}
+	// Pass 1: exact names
+	for _, term := range terms {
+		if exact, ok := byName[term]; ok {
+			add(exact)
+		}
+	}
+	// Pass 2: prefix matches (e.g. "catalog_product_entity_" -> _varchar, _int, _text, …)
+	for _, term := range terms {
+		if _, exact := byName[term]; exact {
+			continue
+		}
+		added := 0
+		for i := range tables {
+			lt := strings.ToLower(tables[i].Name)
+			if strings.HasPrefix(lt, term) && !isAux(lt) {
+				if add(tables[i].Name) {
+					added++
+					if added >= 8 {
+						break
+					}
+				}
+			}
+		}
+	}
+	// Pass 3: substring matches for any remaining term
+	for _, term := range terms {
+		if _, exact := byName[term]; exact || len(term) < 3 {
+			continue
+		}
+		added := 0
+		for i := range tables {
+			lt := strings.ToLower(tables[i].Name)
+			if strings.Contains(lt, term) && !isAux(lt) {
+				if add(tables[i].Name) {
+					added++
+					if added >= 4 {
+						break
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 var thinkRe = regexp.MustCompile(`(?s)<think>.*?</think>`)

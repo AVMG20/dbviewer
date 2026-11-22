@@ -175,3 +175,46 @@ func TestExtractSQL(t *testing.T) {
 		}
 	}
 }
+
+func TestPickTablesMagentoEAVBidirectional(t *testing.T) {
+	tables := append([]TableInfo{
+		{Name: "eav_entity_type", Columns: []model.Column{pk("entity_type_id"), col("entity_type_code"), col("entity_table")}},
+		{Name: "eav_attribute", Columns: []model.Column{pk("attribute_id"), fk("entity_type_id", "eav_entity_type", "entity_type_id"), col("attribute_code"), col("backend_type")}},
+		{Name: "catalog_product_entity_varchar", Columns: []model.Column{pk("value_id"), fk("attribute_id", "eav_attribute", "attribute_id"), fk("entity_id", "catalog_product_entity", "entity_id"), col("value")}},
+		{Name: "catalog_product_entity_int", Columns: []model.Column{pk("value_id"), fk("attribute_id", "eav_attribute", "attribute_id"), fk("entity_id", "catalog_product_entity", "entity_id"), col("value")}},
+		{Name: "catalog_product_entity_text", Columns: []model.Column{pk("value_id"), fk("attribute_id", "eav_attribute", "attribute_id"), fk("entity_id", "catalog_product_entity", "entity_id"), col("value")}},
+	}, magentoTables()...)
+
+	got := names(PickTablesWith("create a query to select all products that have the showrooms attribute filled in", "", "", tables, AgyPickOptions()))
+	t.Logf("picked EAV tables: %v", got)
+	for _, want := range []string{"catalog_product_entity", "catalog_product_entity_varchar", "catalog_product_entity_int", "eav_attribute", "eav_entity_type"} {
+		if index(got, want) < 0 {
+			t.Errorf("expected %s in picked tables: %v", want, got)
+		}
+	}
+}
+
+func TestParseNeedTablesAndResolve(t *testing.T) {
+	terms := ParseNeedTables("NEED_TABLES: `eav_attribute`, catalog_product_entity_<backend_type>, catalog_product_entity_*")
+	if len(terms) != 2 || terms[0] != "eav_attribute" || terms[1] != "catalog_product_entity_" {
+		t.Fatalf("ParseNeedTables = %#v", terms)
+	}
+	if ParseNeedTables("```sql\nSELECT 1\n```") != nil {
+		t.Errorf("expected nil for SQL reply")
+	}
+	tables := []TableInfo{
+		{Name: "eav_attribute"},
+		{Name: "catalog_product_entity"},
+		{Name: "catalog_product_entity_varchar"},
+		{Name: "catalog_product_entity_text"},
+		{Name: "catalog_product_entity_tmp"}, // auxiliary skipped for prefix match
+		{Name: "other_table"},
+	}
+	resolved := ResolveRequestedTables(terms, tables, 10)
+	if index(resolved, "eav_attribute") < 0 || index(resolved, "catalog_product_entity_varchar") < 0 || index(resolved, "catalog_product_entity_text") < 0 {
+		t.Errorf("unexpected resolved tables: %v", resolved)
+	}
+	if index(resolved, "catalog_product_entity_tmp") >= 0 {
+		t.Errorf("auxiliary table should be skipped: %v", resolved)
+	}
+}

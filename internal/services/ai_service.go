@@ -128,6 +128,15 @@ func (s *AIService) GenerateSQL(ctx context.Context, req model.AISQLRequest) (mo
 	return ret(s.generateSQL(ctx, req))
 }
 
+func pickOptionsFor(set model.AISettings, forceTables []string) ai.PickOptions {
+	opts := ai.DefaultPickOptions()
+	if set.Provider == ai.ProviderAgy {
+		opts = ai.AgyPickOptions()
+	}
+	opts.ForceTables = forceTables
+	return opts
+}
+
 func (s *AIService) generateSQL(ctx context.Context, req model.AISQLRequest) (model.AISQLResult, error) {
 	start := time.Now()
 	if strings.TrimSpace(req.Prompt) == "" {
@@ -148,15 +157,51 @@ func (s *AIService) generateSQL(ctx context.Context, req model.AISQLRequest) (mo
 	if len(editorCtx) > ai.ContextChars {
 		editorCtx = editorCtx[:ai.ContextChars]
 	}
-	picked := ai.PickTables(req.Prompt, req.SQL, editorCtx, infos)
-	schemaText, names := ai.SchemaText(picked, req.Prompt)
-	msgs := ai.Messages(p.Driver.Name(), req.Prompt, req.SQL, schemaText, len(infos), len(names), time.Now())
-	sql, stats, err := s.chatSQL(ctx, req.AISettings, req.RequestID, msgs, req.Retry)
+
+	// Fast read-only metadata discovery (e.g. Magento EAV attributes) so the model gets
+	// exact attribute_id / value_table / backend_type on the first call.
+	meta := s.lookupDynamicMeta(ctx, p, req.Schema, req.Prompt, nil, infos)
+	opts := pickOptionsFor(req.AISettings, meta.ForceTables)
+	picked := ai.PickTablesWith(req.Prompt, req.SQL, editorCtx, infos, opts)
+	schemaText, names := ai.SchemaTextWith(picked, req.Prompt, opts)
+	allowNeedTables := req.Provider == ai.ProviderAgy && len(infos) > len(names)
+	msgs := ai.MessagesWith(p.Driver.Name(), req.Prompt, req.SQL, schemaText, len(infos), len(names), time.Now(), ai.PromptExtras{
+		Metadata:        meta.Text,
+		AllowNeedTables: allowNeedTables,
+	})
+
+	sqlText, rawReply, stats, err := s.chatSQLWithRaw(ctx, req.AISettings, req.RequestID, msgs, req.Retry)
+	if err != nil && allowNeedTables {
+		if wanted := ai.ParseNeedTables(rawReply); len(wanted) > 0 {
+			// Self-healing 1-hop retry: fetch the exact tables the model asked for.
+			if req.RequestID != "" {
+				emit(EventAIChunk, model.AIChunk{RequestID: req.RequestID, Thinking: true})
+			}
+			resolved := ai.ResolveRequestedTables(wanted, infos, opts.MaxTables)
+			meta2 := s.lookupDynamicMeta(ctx, p, req.Schema, req.Prompt, wanted, infos)
+			force := append(append([]string(nil), resolved...), meta2.ForceTables...)
+			force = append(force, meta.ForceTables...)
+			if len(force) > 0 {
+				opts2 := pickOptionsFor(req.AISettings, force)
+				picked = ai.PickTablesWith(req.Prompt, req.SQL, editorCtx, infos, opts2)
+				schemaText, names = ai.SchemaTextWith(picked, req.Prompt, opts2)
+				metaText := meta2.Text
+				if metaText == "" {
+					metaText = meta.Text
+				}
+				msgs2 := ai.MessagesWith(p.Driver.Name(), req.Prompt, req.SQL, schemaText, len(infos), len(names), time.Now(), ai.PromptExtras{
+					Metadata:        metaText,
+					AllowNeedTables: false,
+				})
+				sqlText, _, stats, err = s.chatSQLWithRaw(ctx, req.AISettings, req.RequestID, msgs2, req.Retry)
+			}
+		}
+	}
 	if err != nil {
 		return model.AISQLResult{}, err
 	}
 	return model.AISQLResult{
-		SQL:         sql,
+		SQL:         sqlText,
 		Tables:      names,
 		TotalTables: len(infos),
 		Model:       effectiveModel(req.AISettings),
@@ -241,24 +286,29 @@ func (s *AIService) chat(ctx context.Context, set model.AISettings, msgs []ai.Me
 
 // chatSQL runs a chat whose reply is SQL in a code block; streams it as ai:chunk.
 func (s *AIService) chatSQL(ctx context.Context, set model.AISettings, requestID string, msgs []ai.Message, retry bool) (string, ai.ChatStats, error) {
+	sqlText, _, stats, err := s.chatSQLWithRaw(ctx, set, requestID, msgs, retry)
+	return sqlText, stats, err
+}
+
+func (s *AIService) chatSQLWithRaw(ctx context.Context, set model.AISettings, requestID string, msgs []ai.Message, retry bool) (string, string, ai.ChatStats, error) {
 	var last string
 	reply, stats, err := s.chat(ctx, set, msgs, retry, func(content string, thinking bool) {
-		sql, inThink := ai.ExtractSQL(content)
+		sqlText, inThink := ai.ExtractSQL(content)
 		inThink = inThink || thinking
-		if sql == last && !inThink {
+		if sqlText == last && !inThink {
 			return
 		}
-		last = sql
-		emit(EventAIChunk, model.AIChunk{RequestID: requestID, SQL: sql, Thinking: inThink})
+		last = sqlText
+		emit(EventAIChunk, model.AIChunk{RequestID: requestID, SQL: sqlText, Thinking: inThink})
 	})
 	if err != nil {
-		return "", stats, err
+		return "", reply, stats, err
 	}
-	sql, _ := ai.ExtractSQL(reply)
-	if sql == "" {
-		return "", stats, model.Errf(model.ErrInternal, "the model did not return a query: %s", truncate(strings.TrimSpace(reply), 300))
+	sqlText, _ := ai.ExtractSQL(reply)
+	if sqlText == "" {
+		return "", reply, stats, model.Errf(model.ErrInternal, "the model did not return a query: %s", truncate(strings.TrimSpace(reply), 300))
 	}
-	return sql, stats, nil
+	return sqlText, reply, stats, nil
 }
 
 // chatText runs a chat whose reply is prose; streams it as ai:chunk (text).
@@ -304,8 +354,9 @@ func (s *AIService) fixSQL(ctx context.Context, req model.AITaskRequest) (model.
 		return model.AISQLResult{}, err
 	}
 	// the error message names the bad column / table: its words find the right tables
-	picked := ai.PickTables(req.Error, req.SQL, "", infos)
-	schemaText, names := ai.SchemaText(picked, req.SQL+" "+req.Error)
+	opts := pickOptionsFor(req.AISettings, nil)
+	picked := ai.PickTablesWith(req.Error, req.SQL, "", infos, opts)
+	schemaText, names := ai.SchemaTextWith(picked, req.SQL+" "+req.Error, opts)
 	msgs := ai.FixMessages(p.Driver.Name(), req.SQL, req.Error, schemaText, time.Now())
 	sql, stats, err := s.chatSQL(ctx, req.AISettings, req.RequestID, msgs, req.Retry)
 	if err != nil {
@@ -373,7 +424,8 @@ func (s *AIService) explainSQL(ctx context.Context, req model.AITaskRequest) (mo
 	if err != nil {
 		return model.AITextResult{}, err
 	}
-	schemaText, names := ai.SchemaText(referenced(req.SQL, infos), req.SQL)
+	opts := pickOptionsFor(req.AISettings, nil)
+	schemaText, names := ai.SchemaTextWith(referenced(req.SQL, infos), req.SQL, opts)
 	text, stats, err := s.chatText(ctx, req.AISettings, req.RequestID, ai.ExplainMessages(p.Driver.Name(), req.SQL, schemaText), req.Retry)
 	if err != nil {
 		return model.AITextResult{}, err
