@@ -244,7 +244,7 @@ function onContext(e: MouseEvent) {
               <button class="btn" @click="ui.openPalette()"><Icon name="search" /> Jump to…</button>
               <button class="btn" @click="ui.openModal('connection', { projectId: projects.activeProjectId })"><Icon name="plus" /> New connection</button>
             </div>
-            <div class="dim text-[11px]">In the sidebar, just start typing to search tables and columns. Press <kbd>{{ kbd("⌘/") }}</kbd> for all shortcuts.</div>
+            <div class="dim text-[11px]">In the sidebar, press <kbd>{{ kbd("⌘F") }}</kbd> or start typing to find tables. Press <kbd>{{ kbd("⌘/") }}</kbd> for all shortcuts.</div>
           </div>
         </div>
       </main>

@@ -1,82 +1,81 @@
-// Speed-search matcher for the sidebar tree (shell agent): ranks tables by name and by column
-// names (from the schema index) and returns the matched columns of tables that only match
-// through them, so the tree can list those as nested rows.
-import type { Table } from "@/api";
-import { fuzzy, highlightSegments, jumps } from "@/components/common/fuzzy";
-import type { IndexedTable } from "./schemaCache";
+// Sidebar find matcher: fast contiguous substring match with word-boundary / acronym
+// fallback (e.g. "so" -> "sales_order", "salord" -> "sales_order") so highlight-and-jump
+// search never floods the tree with noisy mid-word subsequence hits.
+import { highlightSegments, isSubsequence } from "@/components/common/fuzzy";
 
 export type Seg = { t: string; m: boolean };
 
-export interface ColHit {
-  name: string;
-  /** index into IndexedTable.columns / types */
-  i: number;
-  rank: number;
-  score: number;
+export interface NameMatch {
   segs: Seg[];
+  /** true for a contiguous substring match */
+  exact: boolean;
 }
 
-export interface TableHit {
-  table: Table;
-  rank: number;
-  score: number;
-  /** name highlight (undefined when the table matched through its columns only) */
-  segs?: Seg[];
-  /** matched columns, best first; only filled for column-only matches */
-  cols: ColHit[];
+function isSep(c: number): boolean {
+  // _ - . space / : $
+  return c === 95 || c === 45 || c === 46 || c === 32 || c === 47 || c === 58 || c === 36;
 }
 
-// Rank tiers: exact / prefix / substring name matches first, then strong column matches,
-// then scattered name matches, then scattered column matches. Score breaks ties inside a tier.
-const R_NAME_EXACT = 50;
-const R_NAME_PREFIX = 40;
-const R_NAME_SUB = 30;
-const R_COL_EXACT = 25;
-const R_COL_SUB = 20;
-const R_NAME_FUZZY = 15;
-const R_COL_FUZZY = 10;
-
-/** Columns only match from 2 chars on and only fairly tight: one-letter / scattered hits would flood the tree. */
-export function columnMatch(q: string, name: string, nameL: string, i = 0): ColHit | null {
-  if (q.length < 2) return null;
-  // short queries only match as substrings: scattered 2-3 letter hits are noise (and the DP is the cost)
-  if (q.length < 4 && !nameL.includes(q)) return null;
-  const h = fuzzy(q, name, nameL);
-  if (!h || jumps(h.positions) > (q.length >= 6 ? 2 : 1)) return null;
-  const rank = nameL === q ? R_COL_EXACT : nameL.includes(q) ? R_COL_SUB : R_COL_FUZZY;
-  return { name, i, rank, score: h.score, segs: highlightSegments(name, h.positions) };
+function isWordStart(name: string, idx: number): boolean {
+  if (idx === 0) return true;
+  const p = name.charCodeAt(idx - 1);
+  if (isSep(p)) return true;
+  const c = name.charCodeAt(idx);
+  return c >= 65 && c <= 90 && p >= 97 && p <= 122; // camelCase boundary
 }
 
-/** `q` must be normalized (normQuery). `lookup` returns the index entry of a table (undefined while loading). */
-export function searchTables(q: string, list: readonly Table[], lookup: (name: string) => IndexedTable | undefined): TableHit[] {
-  const hits: TableHit[] = [];
-  // the same column names (id, created_at, store_id, …) recur in most tables: match each name once
-  const memo = new Map<string, ColHit | null>();
-  for (const t of list) {
-    const nl = t.name.toLowerCase();
-    const nh = fuzzy(q, t.name, nl);
-    const nameRank = !nh ? 0 : nl === q ? R_NAME_EXACT : nl.startsWith(q) ? R_NAME_PREFIX : nl.includes(q) ? R_NAME_SUB : R_NAME_FUZZY;
-    const cols: ColHit[] = [];
-    // A clear name match needs no column scan (also keeps 1k-table schemas cheap per keystroke).
-    if (nameRank < R_NAME_SUB) {
-      const it = lookup(t.name);
-      if (it) {
-        for (let i = 0; i < it.columns.length; i++) {
-          const name = it.columns[i];
-          let c = memo.get(name);
-          if (c === undefined) memo.set(name, (c = columnMatch(q, name, it.columnsL[i])));
-          if (c) cols.push({ ...c, i });
-        }
+/**
+ * Matches `nq` against `nameL` where the first char starts a word and every subsequent
+ * char either continues the current run (pos[i] = pos[i-1] + 1) or jumps to a later word start.
+ * Memoized on (qi, ni, canContinue) so repeated-prefix patterns stay polynomial (O(m * n²)) and fast in practice.
+ */
+function matchWordStarts(nq: string, name: string, nameL: string): number[] | null {
+  const m = nq.length;
+  const n = nameL.length;
+  if (m < 2 || m > n || !isSubsequence(nq, nameL)) return null;
+  const pos = new Array<number>(m);
+  const dead = new Uint8Array((m + 1) * (n + 1) * 2);
+
+  function dfs(qi: number, ni: number, canCont: boolean): boolean {
+    if (qi === m) return true;
+    if (ni >= n) return false;
+    const state = ((qi * (n + 1) + ni) << 1) | (canCont ? 1 : 0);
+    if (dead[state]) return false;
+
+    const qc = nq.charCodeAt(qi);
+    if (canCont && nameL.charCodeAt(ni) === qc) {
+      pos[qi] = ni;
+      if (dfs(qi + 1, ni + 1, true)) return true;
+    }
+    const start = canCont ? ni + 1 : ni;
+    for (let j = start; j < n; j++) {
+      if (nameL.charCodeAt(j) === qc && isWordStart(name, j)) {
+        pos[qi] = j;
+        if (dfs(qi + 1, j + 1, true)) return true;
       }
     }
-    if (cols.length) cols.sort((a, b) => b.rank - a.rank || b.score - a.score || a.i - b.i);
-    const best = cols[0];
-    if (nh && (!best || nameRank >= best.rank)) {
-      hits.push({ table: t, rank: nameRank, score: nh.score, segs: highlightSegments(t.name, nh.positions), cols: [] });
-    } else if (best) {
-      hits.push({ table: t, rank: best.rank, score: best.score, cols });
-    }
+    dead[state] = 1;
+    return false;
   }
-  hits.sort((a, b) => b.rank - a.rank || b.score - a.score || a.table.name.localeCompare(b.table.name));
-  return hits;
+
+  return dfs(0, 0, false) ? pos : null;
+}
+
+/**
+ * Matches normalized query `nq` (use normQuery) against a sidebar object name.
+ * Prefers contiguous substring matches; falls back to word-boundary / acronym matches.
+ */
+export function matchSidebarName(nq: string, name: string, nameL: string = name.toLowerCase()): NameMatch | null {
+  if (!nq) return null;
+  const idx = nameL.indexOf(nq);
+  if (idx >= 0) {
+    const segs: Seg[] = [];
+    if (idx > 0) segs.push({ t: name.slice(0, idx), m: false });
+    segs.push({ t: name.slice(idx, idx + nq.length), m: true });
+    if (idx + nq.length < name.length) segs.push({ t: name.slice(idx + nq.length), m: false });
+    return { segs, exact: true };
+  }
+  const pos = matchWordStarts(nq, name, nameL);
+  if (!pos) return null;
+  return { segs: highlightSegments(name, pos), exact: false };
 }

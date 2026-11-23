@@ -48,6 +48,7 @@ const P: Record<string, string> = {
   chevR: '<path d="M6 4l4 4-4 4"/>',
   chevL: '<path d="M10 4L6 8l4 4"/>',
   chevD: '<path d="M4 6l4 4 4-4"/>',
+  chevU: '<path d="M4 10l4-4 4 4"/>',
   sortUp: '<path d="M8 13V3M4 7l4-4 4 4"/>',
   sortDown: '<path d="M8 3v10M4 9l4 4 4-4"/>',
   history: '<path d="M2.5 8a5.5 5.5 0 101.8-4.1M2.5 2.5v3h3M8 5v3.2l2 1.3"/>',

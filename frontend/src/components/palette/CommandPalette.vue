@@ -78,7 +78,7 @@ const commands = computed<Cmd[]>(() => [
     },
   },
   { id: "sidebar", label: "Toggle sidebar", run: () => ui.toggleSidebar() },
-  { id: "focus", label: "Focus sidebar (speed search)", noFocus: true, run: () => ui.focusSidebar() },
+  { id: "focus", label: "Focus sidebar", noFocus: true, run: () => ui.focusSidebar() },
   {
     id: "find", label: "Find in database…", hint: kbd("⇧⌘F"), noFocus: true,
     run: () => ui.openModal("findInDatabase", { connId: tabs.active?.connId ?? "" }),

@@ -31,11 +31,13 @@ const GROUPS: { title: string; keys: [string, string][] }[] = [
   {
     title: "Sidebar",
     keys: [
-      ["Type", "Filter tables and columns"],
+      ["Type / ⌘F", "Find and highlight tables"],
+      ["↑ ↓ / ⌘G", "Next / previous match (in search)"],
+      ["⌥F", "Toggle filter mode (hide non-matches)"],
       ["↑ ↓ ← →", "Move, expand, collapse"],
       ["↵", "Open table"],
       ["⌘↵", "Open structure"],
-      ["Esc", "Clear the filter"],
+      ["Esc", "Close search"],
     ],
   },
   {

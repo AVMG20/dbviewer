@@ -1,9 +1,11 @@
 <script setup lang="ts">
-// Sidebar (shell agent): project switcher, lazy virtualized tree
-// (Connection → schema → Tables/Views → columns), sticky ancestor rows, speed search over
-// table and column names, context menus, resize handle.
+// Sidebar (shell agent): clean ghost project switcher, flattened virtualized tree
+// (Connection → schema → tables/views → columns), capped sticky ancestors, highlight-and-jump
+// find bar (with ↑/↓ navigation, match counter, scrollbar ticks, and optional filter toggle),
+// hover quick actions, context menus, and resize handle.
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { kbd } from "@/lib/kbd";
+import { settings } from "@/lib/settings";
 import { useVirtualizer } from "@tanstack/vue-virtual";
 import { apiError, type ConnectionConfig, type Driver } from "@/api";
 import { useProjectsStore } from "@/stores/projects";
@@ -19,7 +21,7 @@ import { normQuery } from "@/components/common/fuzzy";
 import {
   cache, indexedTable, invalidate, isViewKind, k, kt, loadColumns, loadIndex, loadSchemas, loadTables, qualifiedName, quoteIdent,
 } from "./schemaCache";
-import { columnMatch, searchTables, type ColHit, type Seg, type TableHit } from "./treeSearch";
+import { matchSidebarName, type Seg } from "./treeSearch";
 
 const projects = useProjectsStore();
 const tabs = useTabsStore();
@@ -27,36 +29,36 @@ const ui = useUiStore();
 
 interface Row {
   key: string;
-  kind: "conn" | "schema" | "group" | "table" | "col" | "more" | "msg";
+  kind: "conn" | "schema" | "group" | "section" | "table" | "col" | "msg";
   level: number;
   connId: string;
   schema?: string;
   name?: string;
   tkind?: string;
   group?: "t" | "v" | "o";
-  /** msg row that connects the connection when activated */
-  connect?: boolean;
   count?: number;
   segs?: Seg[];
-  hint?: Seg[];
+  /** true when this row matched the active find query */
+  matched?: boolean;
   text?: string;
   error?: boolean;
   estRows?: number;
-  /** col / more rows: the owning table (name holds the column name) */
+  /** col rows: the owning table (name holds the column name) */
   table?: string;
   /** col rows: display type, pk flag, FK target ("table.column") */
   ctype?: string;
   pk?: boolean;
   fk?: string;
-  /** table row in speed search that matched through its columns only: those are listed under it */
-  byCol?: boolean;
 }
 
 // ---- expansion state ---------------------------------------------------------
 const expanded = reactive(new Set<string>());
 const collapsedGroups = reactive(new Set<string>());
-/** expanded tables (tkey → [connId, schema, table]); the tuple lets loads / refreshes find them without parsing keys */
+/** expanded tables (tkey → [connId, schema, table]) */
 const openTables = reactive(new Map<string, readonly [string, string, string]>());
+/** conn ids whose "Other databases / schemas" group is open */
+const openOthers = reactive(new Set<string>());
+
 const ckey = (id: string) => `c:${id}`;
 const skey = (id: string, s: string) => `s:${id}:${s}`;
 const gkey = (id: string, s: string, g: "t" | "v") => `g:${id}:${s}:${g}`;
@@ -72,7 +74,6 @@ function visibleSchemas(connId: string) {
 async function expandConn(id: string) {
   expanded.add(ckey(id));
   if (!(await projects.ensureConnected(id))) {
-    // keep it open with the error on a row (readable cause, full text in the tooltip / "Show error")
     const err = projects.statuses[id]?.error;
     if (err) cache.errors[id] = err;
     else expanded.delete(ckey(id));
@@ -81,7 +82,7 @@ async function expandConn(id: string) {
   try {
     await loadSchemas(id);
   } catch {
-    return; // error row is shown
+    return;
   }
   const vis = visibleSchemas(id);
   const def = vis.find((s) => s.isDefault) ?? vis[0];
@@ -109,19 +110,17 @@ function toggleGroup(id: string, s: string, g: "t" | "v") {
   if (collapsedGroups.has(key)) collapsedGroups.delete(key);
   else collapsedGroups.add(key);
 }
-
 function toggleTable(id: string, s: string, n: string) {
   const key = tkey(id, s, n);
   if (openTables.has(key)) openTables.delete(key);
   else openTables.set(key, [id, s, n]);
 }
-// Expanded tables whose columns are not cached yet (first expand, refresh, reconnect) load them
-// here; only once their schema's table list is there, i.e. the connection is up.
+
+// Expanded tables whose columns are not cached yet load them once their schema is loaded.
 watch(
   () => [...openTables.values()].filter(([id, s, n]) => cache.tables[k(id, s)] && !cache.columns[kt(id, s, n)] && !cache.errors[`c:${kt(id, s, n)}`]),
   (need) => need.forEach(([id, s, n]) => loadColumns(id, s, n).catch(() => {})),
 );
-/** Drops cached column details (and their errors) of a schema so the watcher above reloads the open ones. */
 function dropColumns(id: string, s: string) {
   const pre = k(id, s) + "\u0000";
   for (const key of Object.keys(cache.columns)) if (key.startsWith(pre)) delete cache.columns[key];
@@ -129,12 +128,11 @@ function dropColumns(id: string, s: string) {
 }
 
 function collapseAll() {
-  clearSpeed();
+  closeFind(false);
   const sel = selRow();
   expanded.clear();
   openTables.clear();
   openOthers.clear();
-  // keep the selection on the connection the selected row lived in
   if (sel) selected.value = ckey(sel.connId);
   nextTick(() => {
     if (scroller.value) scroller.value.scrollTop = 0;
@@ -155,6 +153,14 @@ async function refreshConn(id: string) {
     ui.toast(apiError(e).message, "error");
   }
 }
+async function refreshOrExpand(id: string) {
+  if (expanded.has(ckey(id))) {
+    await refreshConn(id);
+  } else {
+    invalidate(id);
+    await expandConn(id);
+  }
+}
 async function refreshSchema(id: string, s: string) {
   dropColumns(id, s);
   try {
@@ -164,39 +170,53 @@ async function refreshSchema(id: string, s: string) {
   }
 }
 
-// ---- speed search --------------------------------------------------------------
-// A filter over what the tree shows (PhpStorm style): table / view names and column names of
-// expanded schemas match, nothing gets connected or expanded by it. Tables matching only
-// through columns list those columns (best COL_CAP, then "N more") so Enter can open the exact
-// column. It stays on while tables are opened from it by click; Enter and Esc clear it. Cmd+K searches everything.
-const speed = ref("");
-const searching = computed(() => speed.value.length > 0);
-/** matched-column rows shown per table before a "N more" row */
-const COL_CAP = 3;
-/** tables whose "N more" row was activated (reset with every query change) */
-const showAllCols = reactive(new Set<string>());
-/** Cmd+A in the search: the whole query is selected, the next key replaces / deletes it */
-const speedAll = ref(false);
-watch(speed, () => {
-  showAllCols.clear();
-  speedAll.value = false;
-});
+// ---- highlight-and-jump find bar ----------------------------------------------
+// Keeps all tables in place in alphabetical order, highlights matches, and steps
+// through them with ↑/↓ (or ⌘G/⇧⌘G). Optional filter toggle hides non-matches.
+const findOpen = ref(false);
+const findQuery = ref("");
+const filterMode = ref(false);
+const findInput = ref<HTMLInputElement | null>(null);
+const matchIdx = ref(0);
+const normFind = computed(() => normQuery(findQuery.value));
+const hasQuery = computed(() => normFind.value.length > 0);
 
-// Column search needs the schema index (one bulk query per schema, cached by the backend):
-// fetch it for every expanded schema as soon as a search starts.
-watch(
-  () => searching.value && [...expanded].filter((x) => x.startsWith("s:")).join("\n"),
-  (on) => {
-    if (!on) return;
-    for (const c of projects.projectConnections) {
-      if (!expanded.has(ckey(c.id)) || !cache.schemas[c.id]) continue;
-      for (const sc of cache.schemas[c.id]) if (expanded.has(skey(c.id, sc.name))) loadIndex(c.id, sc.name).catch(() => {});
+function openFind(selectExisting = true, initialChar?: string) {
+  findOpen.value = true;
+  if (initialChar !== undefined) {
+    findQuery.value = findQuery.value + initialChar;
+  }
+  nextTick(() => {
+    const el = findInput.value;
+    if (!el) return;
+    el.focus({ preventScroll: true });
+    if (initialChar !== undefined) {
+      const end = el.value.length;
+      el.setSelectionRange(end, end);
+    } else if (selectExisting) {
+      el.select();
     }
-  },
-);
+  });
+}
 
-/** conn ids whose "Other databases / schemas" group is open */
-const openOthers = reactive(new Set<string>());
+function closeFind(focusTree = true) {
+  if (!findOpen.value && !findQuery.value) return;
+  const wasFiltering = filterMode.value && hasQuery.value;
+  const keepKey = selected.value ?? currentMatch.value?.row.key;
+  findOpen.value = false;
+  findQuery.value = "";
+  matchIdx.value = 0;
+  if (keepKey) {
+    selected.value = keepKey;
+    nextTick(() => (wasFiltering ? scrollToKeyMargin(keepKey) : scrollToKey(keepKey)));
+  }
+  if (focusTree) nextTick(() => scroller.value?.focus({ preventScroll: true }));
+}
+
+function toggleFindBar() {
+  if (findOpen.value) closeFind(true);
+  else openFind(true);
+}
 
 function schemaSplit(connId: string) {
   const vis = visibleSchemas(connId);
@@ -211,21 +231,32 @@ function schemaSplit(connId: string) {
 const fkText = (fk?: { table: string; column: string } | null) => (fk ? `${fk.table}.${fk.column}` : undefined);
 
 /** Column rows of an expanded table: full details (pk / fk) when loaded, else names + types from the index. */
-function pushColumns(out: Row[], id: string, s: string, n: string, level: number, nq: string) {
+function pushColumns(out: Row[], id: string, s: string, n: string, level: number, nq: string, filter: boolean) {
   const tk = tkey(id, s, n);
   const base = { kind: "col" as const, level, connId: id, schema: s, table: n };
-  const hl = (name: string) => (nq ? columnMatch(nq, name, name.toLowerCase())?.segs : undefined);
   const det = cache.columns[kt(id, s, n)];
   if (det) {
     for (const c of det) {
-      out.push({ ...base, key: colkey(id, s, n, c.name), name: c.name, ctype: c.type, pk: c.pk, fk: fkText(c.fk), segs: hl(c.name) });
+      const m = nq ? matchSidebarName(nq, c.name) : null;
+      if (filter && !m) continue;
+      out.push({
+        ...base, key: colkey(id, s, n, c.name), name: c.name, ctype: c.type,
+        pk: c.pk, fk: fkText(c.fk), segs: m?.segs, matched: !!m,
+      });
     }
     if (!det.length) out.push({ key: `n:${tk}`, kind: "msg", level, connId: id, text: "No columns" });
     return;
   }
   const it = indexedTable(id, s, n);
   if (it) {
-    it.columns.forEach((c, i) => out.push({ ...base, key: colkey(id, s, n, c), name: c, ctype: it.types[i] || undefined, segs: hl(c) }));
+    it.columns.forEach((c, i) => {
+      const m = nq ? matchSidebarName(nq, c, it.columnsL[i]) : null;
+      if (filter && !m) return;
+      out.push({
+        ...base, key: colkey(id, s, n, c), name: c, ctype: it.types[i] || undefined,
+        segs: m?.segs, matched: !!m,
+      });
+    });
     return;
   }
   const err = cache.errors[`c:${kt(id, s, n)}`];
@@ -235,32 +266,12 @@ function pushColumns(out: Row[], id: string, s: string, n: string, level: number
       : { key: `l:${tk}`, kind: "msg", level, connId: id, text: "Loading…" },
   );
 }
-/** Speed search: the matched columns of a table that matched through them (capped, then a "N more" row). */
-function pushMatchedColumns(out: Row[], id: string, s: string, n: string, level: number, cols: ColHit[]) {
-  const tk = tkey(id, s, n);
-  const it = indexedTable(id, s, n);
-  const det = cache.columns[kt(id, s, n)];
-  // no "1 more" row: showing that one column takes the same space
-  const shown = showAllCols.has(tk) || cols.length <= COL_CAP + 1 ? cols : cols.slice(0, COL_CAP);
-  for (const c of shown) {
-    const d = det?.find((x) => x.name === c.name);
-    out.push({
-      key: colkey(id, s, n, c.name), kind: "col", level, connId: id, schema: s, table: n, name: c.name,
-      ctype: d?.type ?? (it?.types[c.i] || undefined), pk: d?.pk, fk: fkText(d?.fk), segs: c.segs,
-    });
-  }
-  if (shown.length < cols.length) {
-    // name = the first hidden column: the selection moves there when the row is activated
-    out.push({ key: `more:${tk}`, kind: "more", level, connId: id, schema: s, table: n, name: cols[shown.length].name, count: cols.length - shown.length });
-  }
-}
 
-const built = computed(() => {
+const rows = computed<Row[]>(() => {
   const out: Row[] = [];
-  let mTables = 0;
-  let mCols = 0;
-  const q = searching.value;
-  const nq = q ? normQuery(speed.value) : "";
+  const nq = normFind.value;
+  const filtering = !!nq && filterMode.value;
+
   for (const c of projects.projectConnections) {
     out.push({ key: ckey(c.id), kind: "conn", level: 0, connId: c.id, name: c.name });
     if (!expanded.has(ckey(c.id))) continue;
@@ -278,7 +289,9 @@ const built = computed(() => {
     const pushSchema = (s: (typeof vis)[number], lvl: number) => {
       const sk = skey(c.id, s.name);
       const base = showSchemas ? lvl + 1 : lvl;
-      if (showSchemas && (!q || expanded.has(sk))) out.push({ key: sk, kind: "schema", level: lvl, connId: c.id, schema: s.name, name: s.name });
+      if (showSchemas && (!filtering || expanded.has(sk))) {
+        out.push({ key: sk, kind: "schema", level: lvl, connId: c.id, schema: s.name, name: s.name });
+      }
       if (!expanded.has(sk)) return;
       const list = cache.tables[k(c.id, s.name)];
       if (!list) {
@@ -289,39 +302,63 @@ const built = computed(() => {
         );
         return;
       }
-      const hits: Pick<TableHit, "table" | "segs" | "cols">[] = q
-        ? searchTables(nq, list, (n) => indexedTable(c.id, s.name, n))
-        : list.map((t) => ({ table: t, cols: [] }));
-      if (q) {
-        if (!hits.length) out.push({ key: `n:${sk}`, kind: "msg", level: base, connId: c.id, text: "No matches" });
-      }
-      const tbl = hits.filter((h) => !isViewKind(h.table.kind));
-      const vws = hits.filter((h) => isViewKind(h.table.kind));
-      for (const [g, items, label] of [["t", tbl, "Tables"], ["v", vws, "Views"]] as const) {
-        if (!items.length && (g === "v" || q)) continue;
-        const gk = gkey(c.id, s.name, g);
-        out.push({ key: gk, kind: "group", level: base, connId: c.id, schema: s.name, group: g, name: label, count: items.length });
-        if (collapsedGroups.has(gk)) continue;
-        for (const { table: t, segs, cols } of items) {
-          const tk = tkey(c.id, s.name, t.name);
-          out.push({
-            key: tk, kind: "table", level: base + 1, connId: c.id, schema: s.name,
-            name: t.name, tkind: t.kind, estRows: t.estRows, segs, byCol: cols.length > 0,
-          });
-          if (openTables.has(tk)) pushColumns(out, c.id, s.name, t.name, base + 2, nq);
-          else if (cols.length) pushMatchedColumns(out, c.id, s.name, t.name, base + 2, cols);
-          if (q) {
-            mTables++;
-            mCols += cols.length;
+
+      const hasViews = list.some((t) => isViewKind(t.kind));
+      type Entry = { table: (typeof list)[number]; segs?: Seg[]; matched: boolean; hasColHit: boolean };
+      const tbl: Entry[] = [];
+      const vws: Entry[] = [];
+
+      for (const t of list) {
+        const m = nq ? matchSidebarName(nq, t.name) : null;
+        const tk = tkey(c.id, s.name, t.name);
+        let hasColHit = false;
+        if (filtering && !m && openTables.has(tk)) {
+          const det = cache.columns[kt(c.id, s.name, t.name)];
+          if (det) hasColHit = det.some((col) => !!matchSidebarName(nq, col.name));
+          else {
+            const it = indexedTable(c.id, s.name, t.name);
+            if (it) hasColHit = it.columns.some((col, i) => !!matchSidebarName(nq, col, it.columnsL[i]));
           }
         }
+        if (filtering && !m && !hasColHit) continue;
+        const entry: Entry = { table: t, segs: m?.segs, matched: !!m, hasColHit };
+        if (isViewKind(t.kind)) vws.push(entry);
+        else tbl.push(entry);
       }
+
+      if (!tbl.length && !vws.length) {
+        out.push({ key: `n:${sk}`, kind: "msg", level: base, connId: c.id, text: filtering ? "No matches" : "No tables" });
+        return;
+      }
+
+      const emitGroup = (g: "t" | "v", items: Entry[], label: string, showHeader: boolean) => {
+        if (!items.length) return;
+        const gk = gkey(c.id, s.name, g);
+        if (showHeader) {
+          out.push({ key: gk, kind: "section", level: base, connId: c.id, schema: s.name, group: g, name: label, count: items.length });
+          if (collapsedGroups.has(gk)) return;
+        }
+        for (const { table: t, segs, matched, hasColHit } of items) {
+          const tk = tkey(c.id, s.name, t.name);
+          out.push({
+            key: tk, kind: "table", level: base, connId: c.id, schema: s.name,
+            name: t.name, tkind: t.kind, estRows: t.estRows, segs, matched,
+          });
+          if (openTables.has(tk)) {
+            pushColumns(out, c.id, s.name, t.name, base + 1, nq, filtering && !matched && hasColHit);
+          }
+        }
+      };
+
+      // Only show non-indenting Tables / Views section headers when the schema actually has views.
+      emitGroup("t", tbl, "Tables", hasViews);
+      emitGroup("v", vws, "Views", hasViews);
     };
 
     for (const s of main) pushSchema(s, 1);
     if (others.length) {
       const open = openOthers.has(c.id);
-      if (!q || (open && others.some((s) => expanded.has(skey(c.id, s.name))))) {
+      if (!filtering || (open && others.some((s) => expanded.has(skey(c.id, s.name))))) {
         out.push({
           key: `og:${c.id}`, kind: "group", level: 1, connId: c.id, group: "o", count: others.length,
           name: c.driver === "postgres" ? "Other schemas" : "Other databases",
@@ -330,33 +367,123 @@ const built = computed(() => {
       if (open) for (const s of others) pushSchema(s, 2);
     }
   }
-  return { rows: out, mTables, mCols };
+  return out;
 });
-const rows = computed<Row[]>(() => built.value.rows);
-const plural = (n: number, w: string) => `${n.toLocaleString("en-US")} ${w}${n === 1 ? "" : "s"}`;
-/** footer text: "9 tables · 42 columns" */
-const matchText = computed(() => {
-  const { mTables, mCols } = built.value;
-  if (!mTables) return "No matches";
-  return mCols ? `${plural(mTables, "table")} · ${plural(mCols, "column")}` : plural(mTables, "table");
+
+// ---- match list, navigation & scrollbar ticks ----------------------------------
+interface MatchEntry {
+  row: Row;
+  index: number;
+}
+const matches = computed<MatchEntry[]>(() => {
+  if (!hasQuery.value) return [];
+  const out: MatchEntry[] = [];
+  const R = rows.value;
+  for (let i = 0; i < R.length; i++) {
+    if (R[i].matched) out.push({ row: R[i], index: i });
+  }
+  return out;
+});
+const currentMatch = computed<MatchEntry | null>(() => matches.value[matchIdx.value] ?? null);
+const currentMatchKey = computed<string | null>(() => currentMatch.value?.row.key ?? null);
+
+/** Overview ticks along the right edge showing where matches sit in the tree. */
+const matchTicks = computed<{ pct: number; cur: boolean }[]>(() => {
+  const list = matches.value;
+  const total = rows.value.length;
+  if (!hasQuery.value || filterMode.value || !list.length || total <= 1) return [];
+  if (totalSize.value <= viewH.value) return [];
+  const curKey = currentMatchKey.value;
+  const buckets = new Map<number, { pct: number; cur: boolean }>();
+  for (const m of list) {
+    const pct = ((m.index + 0.5) / total) * 100;
+    const b = Math.round(pct * 1.5); // ~150 vertical buckets max
+    const isCur = m.row.key === curKey;
+    const prev = buckets.get(b);
+    if (!prev || isCur) buckets.set(b, { pct, cur: prev?.cur || isCur });
+  }
+  return [...buckets.values()];
+});
+
+function jumpToMatch(idx: number) {
+  const list = matches.value;
+  if (!list.length) return;
+  const i = ((idx % list.length) + list.length) % list.length;
+  matchIdx.value = i;
+  const hit = list[i];
+  selected.value = hit.row.key;
+  nextTick(() => scrollToKeyMargin(hit.row.key));
+}
+function stepMatch(delta: number) {
+  if (!matches.value.length) return;
+  jumpToMatch(matchIdx.value + delta);
+}
+
+watch(normFind, (now, old) => {
+  if (!now) {
+    matchIdx.value = 0;
+    return;
+  }
+  const list = matches.value;
+  if (!list.length) {
+    matchIdx.value = 0;
+    return;
+  }
+  // When refining an active query, stay on the current row if it still matches.
+  if (old && selected.value) {
+    const stay = list.findIndex((m) => m.row.key === selected.value);
+    if (stay >= 0) {
+      matchIdx.value = stay;
+      nextTick(() => scrollToKeyMargin(list[stay].row.key));
+      return;
+    }
+  }
+  jumpToMatch(0);
+});
+
+watch(filterMode, () => {
+  if (!hasQuery.value || !matches.value.length) return;
+  const stay = selected.value ? matches.value.findIndex((m) => m.row.key === selected.value) : -1;
+  jumpToMatch(stay >= 0 ? stay : 0);
+});
+
+watch(matches, (list) => {
+  if (!hasQuery.value) return;
+  if (!list.length) {
+    matchIdx.value = 0;
+    return;
+  }
+  if (selected.value) {
+    const idx = list.findIndex((m) => m.row.key === selected.value);
+    if (idx >= 0) {
+      matchIdx.value = idx;
+      return;
+    }
+  }
+  if (matchIdx.value >= list.length) matchIdx.value = 0;
 });
 
 // ---- selection / virtualization --------------------------------------------------
 const selected = ref<string | null>(null);
 const scroller = ref<HTMLElement | null>(null);
 const focused = ref(false);
-const ROW_H = 22;
+const PAD_TOP = 4; // virtualizer paddingStart (kept off scroller so sticky top: 0 is flush with no see-through gap)
+const PAD_END = 8;
+const rowH = computed(() => (settings.density === "comfortable" ? 28 : 26));
 const virt = useVirtualizer<HTMLElement, Element>(
   computed(() => ({
     count: rows.value.length,
     getScrollElement: () => scroller.value,
-    estimateSize: () => ROW_H,
+    estimateSize: () => rowH.value,
+    paddingStart: PAD_TOP,
+    paddingEnd: PAD_END,
     overscan: 14,
     getItemKey: (i: number) => rows.value[i]?.key ?? i,
   })),
 );
+watch(rowH, () => nextTick(() => virt.value.measure()));
+
 const vItems = computed(() => virt.value.getVirtualItems());
-/** what the tree renders: sticky ancestor rows (in flow, CSS sticky) + the virtual window (absolute) */
 const drawItems = computed(() => {
   const R = rows.value;
   const out = sticky.value.map((s, p) => ({ key: `st:${s.row.key}`, row: s.row, y: s.top, stuck: true, z: 20 - p }));
@@ -368,21 +495,16 @@ const drawItems = computed(() => {
 });
 const totalSize = computed(() => virt.value.getTotalSize());
 
-const PAD_TOP = 4; // tree padding-top (pt-1)
-
-// ---- sticky ancestors ----------------------------------------------------------------
-// The open connection / schema / group / table rows above the viewport stay pinned at the
-// top (VS Code sticky scroll), pushed up by the next sibling as their subtree scrolls out.
-// Row levels are contiguous along a branch, so a row's ancestor at level d is the nearest
-// row above it with that level, and a row has `level` ancestors.
-const STICKY_MAX = 4;
+// ---- sticky ancestors (capped at Connection + Schema) -----------------------------
+const STICKY_MAX = 2;
 const scrollTop = ref(0);
 const viewH = ref(0);
-/** visible sticky rows; only replaced when the stack or an offset changes (not on every scroll pixel) */
 const sticky = shallowRef<{ row: Row; top: number }[]>([]);
-/** how many ancestor rows can stick for the current viewport (a third of it at most) */
-const stickyCap = computed(() => Math.max(1, Math.min(STICKY_MAX, Math.floor(viewH.value / ROW_H / 3))));
+const stickyCap = computed(() => Math.max(1, Math.min(STICKY_MAX, Math.floor(viewH.value / rowH.value / 4))));
 
+function isStickyKind(r: Row): boolean {
+  return r.kind === "conn" || r.kind === "schema" || r.kind === "group";
+}
 function ancestorAt(i: number, lvl: number): number {
   const R = rows.value;
   if (R[i].level <= lvl) return -1;
@@ -395,20 +517,22 @@ function subtreeEnd(i: number): number {
   while (j < R.length && R[j].level > R[i].level) j++;
   return j - 1;
 }
-watch([scrollTop, rows, stickyCap], () => {
+watch([scrollTop, rows, stickyCap, rowH], () => {
   const R = rows.value;
   const st = scrollTop.value;
+  const H = rowH.value;
   const out: { row: Row; top: number }[] = [];
   let parent = -1;
   for (let d = 0; d < stickyCap.value && R.length; d++) {
-    // the row right under the current stack decides which ancestor sticks next
-    const i = Math.min(R.length - 1, Math.floor((st + d * ROW_H - PAD_TOP) / ROW_H));
+    const i = Math.min(R.length - 1, Math.floor((st + d * H - PAD_TOP) / H));
     if (i < 0) break;
-    const a = ancestorAt(i, d);
+    const a = R[i].level === d && st + d * H > PAD_TOP + i * H ? i : ancestorAt(i, d);
     if (a < 0 || (d > 0 && ancestorAt(a, d - 1) !== parent)) break;
-    if (!isOpen(R[a])) break;
-    const endY = PAD_TOP + (subtreeEnd(a) + 1) * ROW_H - st;
-    out.push({ row: R[a], top: Math.min(d * ROW_H, endY - ROW_H) });
+    if (!isStickyKind(R[a]) || !isOpen(R[a])) break;
+    const end = subtreeEnd(a);
+    if (end <= a) break;
+    const endY = PAD_TOP + (end + 1) * H - st;
+    out.push({ row: R[a], top: Math.min(d * H, endY - H) });
     parent = a;
   }
   const sig = (l: { row: Row; top: number }[]) => l.map((x) => `${x.row.key}@${x.top}`).join("|");
@@ -420,24 +544,34 @@ function onScroll() {
 
 /** Height covered by sticky ancestors when row i sits right below them. */
 function stickyAbove(i: number): number {
-  return Math.min(rows.value[i]?.level ?? 0, stickyCap.value) * ROW_H;
+  const R = rows.value;
+  const row = R[i];
+  if (!row) return 0;
+  let count = 0;
+  for (let d = 0; d < stickyCap.value; d++) {
+    const a = ancestorAt(i, d);
+    if (a < 0 || !isStickyKind(R[a]) || !isOpen(R[a])) break;
+    count++;
+  }
+  return count * rowH.value;
 }
 
-/** Scrolls a row into view with ~3 rows of margin; centers it when it is off screen. */
+/** Scrolls a row into view with ~3 rows of margin; centers it when off screen. */
 function scrollToKeyMargin(key: string) {
   const i = rows.value.findIndex((r) => r.key === key);
   const el = scroller.value;
   if (i < 0 || !el) return;
-  const top = i * ROW_H + PAD_TOP;
+  const H = rowH.value;
+  const top = i * H + PAD_TOP;
   const view = el.clientHeight;
   const head = stickyAbove(i);
-  const margin = Math.min(3 * ROW_H, Math.max(0, (view - ROW_H) / 2));
-  if (top < el.scrollTop + head || top + ROW_H > el.scrollTop + view) {
-    el.scrollTop = Math.max(0, top - (view - ROW_H) / 2);
+  const margin = Math.min(3 * H, Math.max(0, (view - head - H) / 2));
+  if (top < el.scrollTop + head || top + H > el.scrollTop + view) {
+    el.scrollTop = Math.max(0, top - head - Math.max(0, view - head - H) / 2);
   } else if (top < el.scrollTop + head + margin) {
     el.scrollTop = Math.max(0, top - head - margin);
-  } else if (top + ROW_H > el.scrollTop + view - margin) {
-    el.scrollTop = top + ROW_H - view + margin;
+  } else if (top + H > el.scrollTop + view - margin) {
+    el.scrollTop = top + H - view + margin;
   }
 }
 
@@ -446,64 +580,40 @@ function scrollToKey(key: string) {
   const i = rows.value.findIndex((r) => r.key === key);
   const el = scroller.value;
   if (i < 0 || !el) return;
-  const top = i * ROW_H + PAD_TOP;
+  const H = rowH.value;
+  const top = i * H + PAD_TOP;
   const head = stickyAbove(i);
   if (top - head < el.scrollTop) el.scrollTop = Math.max(0, top - head);
-  else {
-    const foot = searching.value ? 36 : 0; // speed search overlay over the bottom
-    if (top + ROW_H > el.scrollTop + el.clientHeight - foot) el.scrollTop = top + ROW_H - el.clientHeight + foot;
-  }
+  else if (top + H > el.scrollTop + el.clientHeight) el.scrollTop = top + H - el.clientHeight;
 }
-
-const navRows = computed(() =>
-  searching.value ? rows.value.filter((r) => r.kind === "table" || r.kind === "col" || r.kind === "more" || r.connect) : rows.value,
-);
-/** Best hit: the first table, or its first column when it matched through columns (Enter opens that column). */
-function firstHit(): string | null {
-  const list = navRows.value;
-  const i = list.findIndex((r) => r.kind === "table");
-  if (i < 0) return list[0]?.key ?? null;
-  if (list[i].byCol) for (let j = i + 1; list[j]?.kind === "col"; j++) if (list[j].segs) return list[j].key;
-  return list[i].key;
-}
-watch(rows, () => {
-  if (searching.value) {
-    if (!selected.value || !navRows.value.some((r) => r.key === selected.value)) selected.value = firstHit();
-    nextTick(() => selected.value && scrollToKey(selected.value));
-  }
-});
-watch(speed, () => {
-  if (searching.value) {
-    selected.value = firstHit();
-    scroller.value && (scroller.value.scrollTop = 0);
-  }
-});
 
 function moveSel(delta: number) {
-  const list = navRows.value;
+  const list = rows.value;
   if (!list.length) return;
   let i = list.findIndex((r) => r.key === selected.value);
   i = i < 0 ? (delta > 0 ? 0 : list.length - 1) : Math.max(0, Math.min(list.length - 1, i + delta));
-  selected.value = list[i].key;
-  scrollToKey(list[i].key);
+  const key = list[i].key;
+  selected.value = key;
+  if (hasQuery.value) {
+    const mi = matches.value.findIndex((m) => m.row.key === key);
+    if (mi >= 0) matchIdx.value = mi;
+  }
+  scrollToKey(key);
 }
 function selRow(): Row | undefined {
   return rows.value.find((r) => r.key === selected.value);
 }
 
 // ---- actions ---------------------------------------------------------------------
-/** focus: move keyboard focus into the opened view (Enter / double-click); a single click keeps it in the tree. */
 function openTable(r: Row, structure = false, preview = true, focus = false) {
   if (r.kind !== "table" || !r.name) return;
   if (structure) tabs.openStructure(r.connId, r.schema ?? "", r.name, { focus });
   else tabs.openTable(r.connId, r.schema ?? "", r.name, { preview, focus });
 }
-/** Column row: opens its table like a table row would, then asks the grid to jump to the column. */
 function openColumn(r: Row, structure = false, preview = true, focus = false) {
   if (r.kind !== "col" || !r.table || !r.name) return;
   if (structure) tabs.openStructure(r.connId, r.schema ?? "", r.table, { focus });
   else tabs.openTable(r.connId, r.schema ?? "", r.table, { preview, focus });
-  // only a table view consumes the request: left pending, the next data view of the table would replay it
   if (!structure) ui.focusColumn(r.connId, r.schema ?? "", r.table, r.name);
 }
 function activate(r: Row, alt = false, viaKey = false) {
@@ -518,57 +628,58 @@ function activate(r: Row, alt = false, viaKey = false) {
       if (r.group === "o") {
         if (openOthers.has(r.connId)) openOthers.delete(r.connId);
         else openOthers.add(r.connId);
-      } else toggleGroup(r.connId, r.schema!, r.group as "t" | "v");
+      }
+      break;
+    case "section":
+      if (r.group === "t" || r.group === "v") toggleGroup(r.connId, r.schema!, r.group);
       break;
     case "table":
       openTable(r, alt, true, viaKey);
       break;
     case "col":
-      // a click only selects a column; Enter / double-click opens it
       if (viaKey) openColumn(r, alt, true, true);
       break;
-    case "more":
-      showAllCols.add(tkey(r.connId, r.schema!, r.table!));
-      selected.value = colkey(r.connId, r.schema!, r.table!, r.name!);
-      break;
     case "msg":
-      if (r.connect) void expandConn(r.connId);
-      else if (r.error && r.table) delete cache.errors[`c:${kt(r.connId, r.schema!, r.table)}`]; // column load retry
+      if (r.error && r.table) delete cache.errors[`c:${kt(r.connId, r.schema!, r.table)}`];
       else if (r.error) void refreshConn(r.connId);
       break;
   }
 }
-/** Enter: opening a table / column from the search ends the search and shows the row in the full tree. */
-function activateByKey(r: Row, alt: boolean) {
-  activate(r, alt, true);
-  if (!searching.value || (r.kind !== "table" && r.kind !== "col")) return;
-  clearSpeed();
-  void reveal(r.connId, r.schema, r.kind === "table" ? r.name : r.table, false, r.kind === "col" ? r.name : undefined);
-}
-function clearSpeed(keepSel = false) {
-  const sel = selected.value;
-  speed.value = "";
-  if (keepSel && sel) nextTick(() => scrollToKey(sel));
+
+function openCurrentMatch(structure = false) {
+  const hit = hasQuery.value ? currentMatch.value?.row : selRow();
+  if (!hit) return;
+  const wasFiltering = filterMode.value && hasQuery.value;
+  activate(hit, structure, true);
+  if (hit.kind === "table" || hit.kind === "col") {
+    const keepKey = hit.key;
+    findOpen.value = false;
+    findQuery.value = "";
+    matchIdx.value = 0;
+    selected.value = keepKey;
+    nextTick(() => (wasFiltering ? scrollToKeyMargin(keepKey) : scrollToKey(keepKey)));
+  }
 }
 
 function onRowClick(r: Row) {
   selected.value = r.key;
+  if (hasQuery.value) {
+    const mi = matches.value.findIndex((m) => m.row.key === r.key);
+    if (mi >= 0) matchIdx.value = mi;
+  }
   scroller.value?.focus({ preventScroll: true });
   activate(r);
-  // a click must leave the tree focused so typing still starts speed search
   nextTick(() => scroller.value?.focus({ preventScroll: true }));
 }
 function onRowDblClick(r: Row) {
   if (r.kind === "table") openTable(r, false, false, true);
   else if (r.kind === "col") openColumn(r, false, false, true);
 }
-/** Chevron: expand / collapse only (a table row click would open the table). */
 function onChevClick(r: Row) {
   selected.value = r.key;
   toggle(r);
   nextTick(() => scroller.value?.focus({ preventScroll: true }));
 }
-/** A sticky row: same as a click, but collapsing it must not leave the view scrolled deep into nothing. */
 function onStickyClick(r: Row, chev = false) {
   const wasOpen = isOpen(r);
   if (chev) onChevClick(r);
@@ -589,42 +700,75 @@ function parentIndex(i: number): number {
 function isOpen(r: Row): boolean {
   if (r.kind === "conn") return expanded.has(ckey(r.connId));
   if (r.kind === "schema") return expanded.has(skey(r.connId, r.schema!));
-  if (r.kind === "group") return r.group === "o" ? openOthers.has(r.connId) : !collapsedGroups.has(gkey(r.connId, r.schema!, r.group as "t" | "v"));
-  // speed search lists the matched columns of a column-only hit without expanding the table
-  if (r.kind === "table") return openTables.has(r.key) || (searching.value && !!r.byCol);
+  if (r.kind === "group") return openOthers.has(r.connId);
+  if (r.kind === "section") return !collapsedGroups.has(gkey(r.connId, r.schema!, r.group as "t" | "v"));
+  if (r.kind === "table") return openTables.has(r.key);
   return false;
 }
 function canExpand(r: Row) {
-  return r.kind === "conn" || r.kind === "schema" || r.kind === "group" || r.kind === "table";
+  return r.kind === "conn" || r.kind === "schema" || r.kind === "group" || r.kind === "section" || r.kind === "table";
 }
-/** open and closable by ArrowLeft (a column-only search hit shows its matches without being expanded) */
-function canCollapse(r: Row) {
-  return canExpand(r) && isOpen(r) && (r.kind !== "table" || openTables.has(r.key));
+
+// ---- keyboard -------------------------------------------------------------------
+function onAsideKeydown(e: KeyboardEvent) {
+  const mod = isMod(e);
+  const kLow = e.key.toLowerCase();
+  if (mod && !e.altKey && !e.shiftKey && kLow === "f") {
+    e.preventDefault();
+    e.stopPropagation();
+    openFind(true);
+    return;
+  }
+  if (((mod && !e.altKey && kLow === "g") || e.key === "F3") && hasQuery.value) {
+    e.preventDefault();
+    e.stopPropagation();
+    stepMatch(e.shiftKey ? -1 : 1);
+    return;
+  }
+  if (e.altKey && !mod && !e.shiftKey && e.code === "KeyF" && findOpen.value) {
+    e.preventDefault();
+    e.stopPropagation();
+    filterMode.value = !filterMode.value;
+    return;
+  }
+  if (e.key === "Escape" && findOpen.value && !menu.value && !projMenu.value && !errDlg.value && !projDlg.value) {
+    e.preventDefault();
+    e.stopPropagation();
+    closeFind(true);
+    return;
+  }
+}
+
+function onFindKeydown(e: KeyboardEvent) {
+  const mod = isMod(e);
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    if (matches.value.length) stepMatch(1);
+    else moveSel(1);
+    return;
+  }
+  if (e.key === "ArrowUp") {
+    e.preventDefault();
+    if (matches.value.length) stepMatch(-1);
+    else moveSel(-1);
+    return;
+  }
+  if (e.key === "Enter") {
+    e.preventDefault();
+    openCurrentMatch(mod || e.shiftKey);
+    return;
+  }
 }
 
 function onKeydown(e: KeyboardEvent) {
   const mod = isMod(e);
-  if (searching.value && speedAll.value && !onSpeedAllKey(e, mod)) return;
   if (e.metaKey || e.ctrlKey || e.altKey) {
-    if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "a") {
-      if (searching.value) {
-        e.preventDefault();
-        speedAll.value = true;
-      }
-    } else if (mod && e.key === "Enter") {
+    if (mod && e.key === "Enter") {
       const r = selRow();
       if (r) {
         e.preventDefault();
-        activateByKey(r, true);
+        activate(r, true, true);
       }
-    } else if ((e.key === "Backspace" && mod) || (e.ctrlKey && e.key === "u")) {
-      if (searching.value) {
-        e.preventDefault();
-        speed.value = "";
-      }
-    } else if (e.altKey && e.key === "Backspace" && searching.value) {
-      e.preventDefault();
-      speed.value = speed.value.replace(/\S*\s*$/, "");
     }
     return;
   }
@@ -639,39 +783,31 @@ function onKeydown(e: KeyboardEvent) {
     case "Enter":
       if (r) {
         e.preventDefault();
-        activateByKey(r, e.shiftKey);
+        activate(r, e.shiftKey, true);
       }
       return;
     case "Escape":
-      if (searching.value) {
+      if (findOpen.value) {
         e.preventDefault();
         e.stopPropagation();
-        clearSpeed(true);
+        closeFind(true);
       } else if (tabs.activeId) {
         e.preventDefault();
-        ui.focusActiveView(); // Esc in the tree returns to the active tab
-      }
-      return;
-    case "Backspace":
-      if (searching.value) {
-        e.preventDefault();
-        speed.value = speed.value.slice(0, -1);
+        ui.focusActiveView();
       }
       return;
     case "ArrowRight":
-      // while searching only tables expand (the other tree levels are hidden / not navigable)
-      if (r && canExpand(r) && (!searching.value || r.kind === "table")) {
+      if (r && canExpand(r)) {
         e.preventDefault();
-        // a column-only search hit shows just its matches: → widens it to all columns first
-        if (!isOpen(r) || (r.kind === "table" && !openTables.has(r.key))) toggle(r);
+        if (!isOpen(r)) toggle(r);
         else moveSel(1);
       }
       return;
     case "ArrowLeft":
-      if (r && (!searching.value || r.kind === "table" || r.kind === "col" || r.kind === "more")) {
+      if (r) {
         e.preventDefault();
-        if (canCollapse(r)) toggle(r);
-        else if (!searching.value || r.kind !== "table") {
+        if (canExpand(r) && isOpen(r)) toggle(r);
+        else {
           const i = rows.value.findIndex((x) => x.key === r.key);
           const p = i >= 0 ? parentIndex(i) : -1;
           if (p >= 0) {
@@ -691,57 +827,19 @@ function onKeydown(e: KeyboardEvent) {
       return;
   }
   if (e.key.length === 1) {
-    if (e.key === " " && !searching.value) {
+    if (e.key === " " && !findOpen.value) {
       e.preventDefault();
       if (r && canExpand(r)) toggle(r);
       return;
     }
     e.preventDefault();
-    speed.value += e.key;
+    openFind(false, e.key);
   }
-}
-
-/** A key while the whole query is selected; returns true to continue with the normal handling. */
-function onSpeedAllKey(e: KeyboardEvent, mod: boolean): boolean {
-  if (["Meta", "Control", "Alt", "Shift"].includes(e.key)) return false;
-  const k = e.key.toLowerCase();
-  if (mod && !e.altKey && (k === "a" || k === "c" || k === "x")) {
-    e.preventDefault();
-    if (k !== "a") void navigator.clipboard?.writeText(speed.value).catch(() => {});
-    if (k === "x") speed.value = "";
-    return false;
-  }
-  if (e.key === "Backspace" || e.key === "Delete") {
-    e.preventDefault();
-    speed.value = "";
-    return false;
-  }
-  if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
-    e.preventDefault();
-    speed.value = e.key;
-    return false;
-  }
-  if (!mod || k !== "v") speedAll.value = false; // paste replaces (onPaste); anything else deselects
-  return true;
-}
-
-function onPaste(e: ClipboardEvent) {
-  const t = e.clipboardData?.getData("text")?.trim();
-  if (t && !t.includes("\n")) {
-    e.preventDefault();
-    speed.value = speedAll.value ? t : speed.value + t;
-  }
-}
-/** Clicking the search box keeps the tree focused; a double click selects the query. */
-function onSpeedMouse(e: MouseEvent) {
-  e.preventDefault();
-  scroller.value?.focus({ preventScroll: true });
-  speedAll.value = e.detail >= 2;
 }
 
 // ---- reveal / focus ---------------------------------------------------------------
 async function reveal(connId: string, schema?: string, table?: string, focus = true, column?: string) {
-  if (focus) clearSpeed();
+  if (focus) closeFind(false);
   expanded.add(ckey(connId));
   if (!cache.schemas[connId]) await expandConn(connId);
   if (!cache.schemas[connId]) return;
@@ -756,7 +854,6 @@ async function reveal(connId: string, schema?: string, table?: string, focus = t
       collapsedGroups.delete(gkey(connId, s, "v"));
       if (column) {
         openTables.set(tkey(connId, s, table), [connId, s, table]);
-        // details first (pk / fk); the index still yields the column rows if that fails
         await loadColumns(connId, s, table).catch(() => loadIndex(connId, s).catch(() => {}));
       }
     }
@@ -764,11 +861,12 @@ async function reveal(connId: string, schema?: string, table?: string, focus = t
   await nextTick();
   const key =
     table && s !== undefined ? (column ? colkey(connId, s, table, column) : tkey(connId, s, table)) : ckey(connId);
-  // Following the active tab must not undo a column reveal of the same table (the palette opens
-  // the table and reveals the column at once; whichever finishes last would win).
   if (!column && table && s !== undefined && selected.value?.startsWith(colkey(connId, s, table, ""))) return;
+  if (filterMode.value && hasQuery.value && !rows.value.some((r) => r.key === key)) {
+    filterMode.value = false;
+    await nextTick();
+  }
   if (!rows.value.some((r) => r.key === key) && column) {
-    // column unknown (renamed / stale palette index): fall back to the table row
     return reveal(connId, schema, table, focus);
   }
   selected.value = key;
@@ -779,12 +877,11 @@ watch(
   () => ui.revealRequest,
   (r) => r && void reveal(r.connId, r.schema, r.table, r.focus !== false, r.column),
 );
-// Follow the active tab: expand its connection / schema / group, select + scroll, no focus steal.
 watch(
   () => [tabs.activeId, projects.loaded] as const,
   () => {
     const t = tabs.active;
-    if (!t || searching.value || !projects.getConnection(t.connId)) return;
+    if (!t || hasQuery.value || !projects.getConnection(t.connId)) return;
     if (projects.getConnection(t.connId)?.projectId !== projects.activeProjectId) return;
     if (t.kind === "console") {
       if (!expanded.has(ckey(t.connId)) && !projects.isConnected(t.connId)) {
@@ -822,13 +919,14 @@ watch(
 );
 
 onMounted(() => {
-  // Auto-expand connections that are already open.
   for (const c of projects.projectConnections) if (projects.isConnected(c.id)) void expandConn(c.id);
 });
 watch(
   () => projects.activeProjectId,
   () => {
-    speed.value = "";
+    findOpen.value = false;
+    findQuery.value = "";
+    matchIdx.value = 0;
     selected.value = null;
     for (const c of projects.projectConnections) if (projects.isConnected(c.id) && !expanded.has(ckey(c.id))) void expandConn(c.id);
   },
@@ -836,7 +934,6 @@ watch(
 
 // ---- context menus ------------------------------------------------------------------
 const menu = ref<{ x: number; y: number; items: MenuItem[]; run: (id: string) => void } | null>(null);
-/** the menu emits close before select, so the handler must outlive `menu` */
 let menuRun: ((id: string) => void) | null = null;
 watch(menu, (m) => m && (menuRun = m.run));
 
@@ -919,7 +1016,7 @@ function openMenu(r: Row, x: number, y: number) {
         } else if (id === "delete") await deleteConn(c.id);
       },
     };
-  } else if (r.kind === "schema" || (r.kind === "group" && r.schema !== undefined)) {
+  } else if (r.kind === "schema" || (r.kind === "section" && r.schema !== undefined)) {
     const s = r.schema!;
     menu.value = {
       x, y,
@@ -1090,6 +1187,7 @@ function newConnection() {
 }
 
 // ---- resize -------------------------------------------------------------------------
+const dragging = ref(false);
 function startResize(e: MouseEvent) {
   e.preventDefault();
   const startX = e.clientX;
@@ -1108,8 +1206,6 @@ function startResize(e: MouseEvent) {
 }
 
 // ---- drag reorder (connections) -------------------------------------------------------
-// A connection is dragged by its row; any row of another connection is a drop target:
-// the upper half of its connection row drops before it, everything below drops after it.
 const dragConn = ref("");
 const dropAt = ref<{ connId: string; after: boolean } | null>(null);
 function onDragStart(e: DragEvent, r: Row) {
@@ -1156,7 +1252,6 @@ function onDragEnd() {
   dragConn.value = "";
   dropAt.value = null;
 }
-/** Drop indicator: a line above the target connection row, or below its last row. */
 const lastRowOf = computed(() => {
   const m: Record<string, string> = {};
   for (const r of rows.value) m[r.connId] = r.key;
@@ -1170,7 +1265,7 @@ function dropClass(r: Row): string | undefined {
 }
 
 // ---- row helpers ----------------------------------------------------------------------
-/** Shortens the longest unmatched run (middle ellipsis) until the segments fit `max` chars; matched text is never cut. */
+/** Shortens the longest unmatched run (middle ellipsis) so matched text stays visible in narrow sidebars. */
 function fitSegs(segs: Seg[], max: number): Seg[] {
   const out = segs.map((s) => ({ ...s }));
   let total = out.reduce((n, s) => n + s.t.length, 0);
@@ -1189,9 +1284,7 @@ function fitSegs(segs: Seg[], max: number): Seg[] {
   }
   return out;
 }
-/** Measured width of one monospace character in the tree's real font (canvas), cached per font. */
 let charWCache: { font: string; w: number } | null = null;
-/** The font lookup forces a style recalc; fitRow runs per row per render, so it is re-read only on a new tick. */
 let charWTick: number | null = null;
 function charWidth(): number {
   if (charWTick !== null && charWCache) return charWCache.w;
@@ -1199,19 +1292,18 @@ function charWidth(): number {
   const el = scroller.value;
   const cs = el ? getComputedStyle(el) : null;
   const size = cs?.fontSize ?? "12.5px";
-  const mono = getComputedStyle(document.documentElement).getPropertyValue("--mono").trim() || "monospace";
-  const font = `${size} ${mono}`;
+  const sans = getComputedStyle(document.documentElement).getPropertyValue("--sans").trim() || "sans-serif";
+  const font = `${size} ${sans}`;
   if (charWCache?.font === font) return charWCache.w;
   const ctx = document.createElement("canvas").getContext("2d");
-  let w = parseFloat(size) * 0.6;
+  let w = parseFloat(size) * 0.54;
   if (ctx) {
     ctx.font = font;
-    w = ctx.measureText("MMMMMMMMMMMMMMMMMMMM").width / 20 || w;
+    w = ctx.measureText("sales_order_entity_id").width / 21 || w;
   }
   charWCache = { font, w };
   return w;
 }
-/** Tree viewport width, kept current by a ResizeObserver (sidebar resize, search panel growth). */
 const treeW = ref(0);
 let treeRO: ResizeObserver | null = null;
 onMounted(() => {
@@ -1227,44 +1319,52 @@ onMounted(() => {
 });
 onBeforeUnmount(() => treeRO?.disconnect());
 
-/**
- * Name + hint segments. Normal tree: the CSS end-ellipsis handles overflow. In speed search the matched
- * text must stay visible, so unmatched runs are middle-truncated to the real available width.
- */
-function fitRow(r: Row): { name: Seg[]; hint?: Seg[] } {
-  const name = r.segs ?? [{ t: r.name ?? "", m: false }];
-  if (!searching.value) return { name, hint: r.hint };
-  // row = left/right margin 12 + padding-left (8 + level*14) + padding-right 8 + chevron 11 + icon 13 + 2 gaps of 6 + scrollbar 10
-  const px = Math.max(0, treeW.value - (12 + 8 + r.level * 14 + 8 + 11 + 13 + 12 + 10));
-  const avail = Math.floor(px / charWidth());
-  if (!r.hint) return { name: fitSegs(name, avail) };
-  const hintLen = r.hint.reduce((n, s) => n + s.t.length, 0);
-  const hint = fitSegs(r.hint, Math.max(14, Math.min(hintLen, avail - 12)));
-  const hl = hint.reduce((n, s) => n + s.t.length, 0) + 3;
-  return { name: fitSegs(name, Math.max(10, avail - hl)), hint };
+function rowSegs(r: Row): Seg[] {
+  const segs = r.segs ?? [{ t: r.name ?? "", m: false }];
+  if (!r.matched || !r.segs) return segs;
+  // Keep highlighted runs visible by middle-truncating long unmatched spans.
+  const rightReserve = r.kind === "table" && r.estRows !== undefined && r.estRows >= 0 ? 36 : 12;
+  const px = Math.max(40, treeW.value - (12 + 6 + r.level * 12 + 13 + 18 + rightReserve));
+  const avail = Math.max(10, Math.floor(px / charWidth()));
+  return fitSegs(segs, avail);
 }
-const dragging = ref(false);
-const effWidth = computed(() => ui.sidebarWidth);
+
+function formatCompactRows(n?: number): string {
+  if (n === undefined || n < 0) return "";
+  if (n < 1000) return String(n);
+  if (n < 100_000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+  if (n < 1_000_000) return Math.round(n / 1000) + "k";
+  if (n < 100_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
+  return Math.round(n / 1_000_000) + "M";
+}
+
+function connOf(id: string): ConnectionConfig | undefined {
+  return projects.getConnection(id);
+}
 function accentOf(id: string): string | undefined {
   const c = connOf(id)?.color;
   return c && c !== "none" ? c : undefined;
 }
+function statusDotColor(id: string): string {
+  const c = connOf(id)?.color;
+  if (c && c !== "none") return `var(--conn-${c})`;
+  return projects.isConnected(id) ? "var(--ok)" : "var(--dim)";
+}
 function badge(d?: string): string {
   return DRIVER_BADGE[d as Driver] ?? (d ?? "").slice(0, 2).toUpperCase();
-}
-function connOf(id: string): ConnectionConfig | undefined {
-  return projects.getConnection(id);
 }
 function isActiveTable(r: Row) {
   const t = tabs.active;
   if (t && r.kind === "conn") return t.kind === "console" && t.connId === r.connId;
   return !!t && r.kind === "table" && t.connId === r.connId && (t.schema ?? "") === (r.schema ?? "") && t.table === r.name;
 }
+function isDimmed(r: Row): boolean {
+  return hasQuery.value && !filterMode.value && (r.kind === "table" || r.kind === "col") && !r.matched;
+}
 function rowTitle(r: Row): string | undefined {
   if (r.kind === "table") {
-    const col = r.hint ? ` · ${r.hint.map((x) => x.t).join("")}` : "";
     const rowsTxt = r.estRows !== undefined && r.estRows >= 0 ? ` · ~${r.estRows.toLocaleString("en-US")} rows` : "";
-    return `${r.name}${col}${rowsTxt}`;
+    return `${r.name}${rowsTxt}`;
   }
   if (r.kind === "col") {
     return [`${r.name}${r.ctype ? " " + r.ctype : ""}`, r.pk && "primary key", r.fk && `→ ${r.fk}`].filter(Boolean).join(" · ");
@@ -1276,109 +1376,172 @@ function rowTitle(r: Row): string | undefined {
 </script>
 
 <template>
-  <!-- The wrapper keeps the layout width; while speed searching the aside grows over the content (no reflow). -->
   <div v-show="ui.sidebarVisible" class="no-drag relative flex-none" :style="{ width: ui.sidebarWidth + 'px' }">
   <aside
     class="absolute inset-y-0 left-0 flex flex-col border-r border-bd bg-bg2"
-    :style="{
-      width: effWidth + 'px',
-      zIndex: effWidth > ui.sidebarWidth ? 'var(--z-popover)' : undefined,
-      boxShadow: effWidth > ui.sidebarWidth ? '8px 0 28px -10px var(--shadow)' : undefined,
-      transition: dragging ? 'none' : 'width .12s ease',
-    }"
+    :style="{ width: ui.sidebarWidth + 'px', transition: dragging ? 'none' : 'width .12s ease' }"
+    @keydown="onAsideKeydown"
   >
-    <!-- project switcher -->
-    <div class="flex flex-none items-center gap-1.5 border-b border-bd p-2">
+    <!-- header: ghost project switcher + compact icon actions -->
+    <div class="flex flex-none items-center gap-0.5 border-b border-bd px-2 py-1.5">
       <button
-        class="btn !h-6 min-w-0 flex-1 !justify-between font-semibold"
-        :title="'Switch project'"
+        class="hdr-proj min-w-0 flex-1"
+        title="Switch project"
         @click="openProjMenu"
       >
-        <span class="flex min-w-0 items-center gap-1.5">
-          <Icon name="folder" class="dim" />
-          <span class="truncate">{{ projects.activeProject?.name ?? "…" }}</span>
-        </span>
-        <span class="dim text-[9px]">▾</span>
+        <Icon name="folder" :size="13" class="dim flex-none" />
+        <span class="truncate font-semibold">{{ projects.activeProject?.name ?? "…" }}</span>
+        <Icon name="chevD" :size="11" class="dim flex-none opacity-70" />
       </button>
       <button
-        class="btn !h-6 !px-1.5"
+        class="hdr-icon"
+        :class="{ on: findOpen }"
+        :title="kbd('Find in sidebar (⌘F)')"
+        aria-label="Find in sidebar"
+        @click="toggleFindBar"
+      ><Icon name="search" :size="13" /></button>
+      <button
+        class="hdr-icon"
         title="Collapse all"
+        aria-label="Collapse all"
         :disabled="!expanded.size && !openTables.size"
         @click="collapseAll"
-      ><Icon name="collapse" /></button>
-      <button class="btn !h-6" title="New connection" @click="newConnection"><Icon name="plus" /> <span>Connection</span></button>
+      ><Icon name="collapse" :size="13" /></button>
+      <button
+        class="hdr-icon"
+        title="New connection"
+        aria-label="New connection"
+        @click="newConnection"
+      ><Icon name="plus" :size="13" /></button>
     </div>
 
-    <!-- tree -->
-    <div
-      ref="scroller"
-      tabindex="0"
-      class="min-h-0 flex-1 overflow-auto pb-9 pt-1 outline-none"
-      role="tree"
-      aria-label="Connections"
-      @keydown="onKeydown"
-      @paste="onPaste"
-      @focus="focused = true"
-      @blur="focused = false"
-      @scroll="onScroll"
-    >
-      <div v-if="projects.loaded && !projects.projectConnections.length" class="flex flex-col items-center gap-2 px-4 py-10 text-center">
-        <div class="dim">No connections in this project yet.</div>
-        <button class="btn primary" @click="newConnection"><Icon name="plus" /> New connection</button>
+    <!-- top find bar (highlight-and-jump by default, optional filter toggle) -->
+    <div v-if="findOpen" class="findbar flex flex-none items-center gap-1 border-b border-bd px-2 py-1.5">
+      <div class="findbox flex min-w-0 flex-1 items-center gap-1.5">
+        <Icon name="search" :size="12" :class="hasQuery ? 'text-ac' : 'dim'" />
+        <input
+          ref="findInput"
+          v-model="findQuery"
+          class="find-input min-w-0 flex-1"
+          placeholder="Find tables…"
+          spellcheck="false"
+          autocomplete="off"
+          aria-label="Find tables in sidebar"
+          @keydown="onFindKeydown"
+        />
+        <span
+          v-if="hasQuery"
+          class="find-cnt mono"
+          :class="{ none: !matches.length }"
+        >{{ matches.length ? `${matchIdx + 1}/${matches.length}` : "0/0" }}</span>
       </div>
-      <div :style="{ height: totalSize + 'px', position: 'relative', width: '100%' }">
-        <!-- Sticky ancestors come first and stay in flow (CSS sticky, no scroll lag); the virtual rows are absolute.
-             Sticky offsets count from the scroller's padding edge, hence - PAD_TOP. -->
-        <div
-          v-for="it in drawItems"
-          :key="it.key"
-          class="rowwrap px-1.5"
-          :class="it.stuck ? 'stk' : 'absolute left-0 right-0 top-0'"
-          :style="it.stuck ? { top: it.y - PAD_TOP + 'px', zIndex: it.z, height: ROW_H + 'px' } : { transform: `translateY(${it.y}px)`, height: ROW_H + 'px' }"
-        >
-          <div
-            class="tree-row flex h-full items-center gap-1.5 whitespace-nowrap pr-2"
-            :class="[{
-              sel: selected === it.row.key,
-              foc: focused,
-              act: isActiveTable(it.row),
-              msg: it.row.kind === 'msg',
-              dragging: it.row.kind === 'conn' && dragConn === it.row.connId,
-            }, it.stuck ? undefined : dropClass(it.row)]"
-            :style="{
-              paddingLeft: 8 + it.row.level * 14 + 'px',
-              '--conn': it.row.kind === 'conn' ? projects.connColor(it.row.connId) : undefined,
-            }"
-            :role="it.stuck ? undefined : 'treeitem'"
-            :data-accent="accentOf(it.row.connId)"
-            :aria-selected="it.stuck ? undefined : selected === it.row.key"
-            :aria-hidden="it.stuck || undefined"
-            :title="rowTitle(it.row)"
-            @click="it.stuck ? onStickyClick(it.row) : onRowClick(it.row)"
-            @dblclick="onRowDblClick(it.row)"
-            @contextmenu="onContext($event, it.row)"
-            :draggable="it.row.kind === 'conn'"
-            @dragstart="onDragStart($event, it.row)"
-            @dragover="onDragOver($event, it.row)"
-            @drop="onDrop"
-            @dragend="onDragEnd"
-          >
-            <!-- chevron -->
-            <span
-              v-if="canExpand(it.row)"
-              class="chev"
-              :class="{ open: isOpen(it.row) }"
-              @click.stop="it.stuck ? onStickyClick(it.row, true) : onChevClick(it.row)"
-              @dblclick.stop
-            ><Icon name="chev" :size="11" /></span>
-            <span v-else class="inline-block w-[11px] flex-none" />
+      <button
+        class="find-btn"
+        :disabled="!matches.length"
+        :title="kbd('Previous match (↑ / ⇧⌘G)')"
+        aria-label="Previous match"
+        @mousedown.prevent
+        @click="stepMatch(-1)"
+      ><Icon name="chevU" :size="12" /></button>
+      <button
+        class="find-btn"
+        :disabled="!matches.length"
+        :title="kbd('Next match (↓ / ⌘G)')"
+        aria-label="Next match"
+        @mousedown.prevent
+        @click="stepMatch(1)"
+      ><Icon name="chevD" :size="12" /></button>
+      <button
+        class="find-btn"
+        :class="{ on: filterMode }"
+        :title="kbd('Filter matching only (⌥F)')"
+        aria-label="Toggle filter mode"
+        :aria-pressed="filterMode"
+        @mousedown.prevent
+        @click="filterMode = !filterMode; findInput?.focus()"
+      ><Icon name="filter" :size="12" /></button>
+      <button
+        class="find-btn"
+        title="Close (Esc)"
+        aria-label="Close find"
+        @click="closeFind(true)"
+      ><Icon name="x" :size="11" /></button>
+    </div>
 
-            <template v-if="it.row.kind === 'conn'">
-              <span class="conn-dot" />
-              <span class="truncate font-medium">{{ it.row.name }}</span>
-              <span class="badge">{{ badge(connOf(it.row.connId)?.driver) }}</span>
-              <span v-if="projects.isReadOnly(it.row.connId)" class="text-danger" title="Read-only"><Icon name="lock" :size="11" /></span>
-              <span class="ml-auto flex items-center">
+    <!-- tree + match overview ticks -->
+    <div class="relative flex min-h-0 flex-1 flex-col">
+      <div
+        ref="scroller"
+        tabindex="0"
+        class="min-h-0 flex-1 overflow-auto outline-none"
+        role="tree"
+        aria-label="Connections"
+        @keydown="onKeydown"
+        @focus="focused = true"
+        @blur="focused = false"
+        @scroll="onScroll"
+      >
+        <div v-if="projects.loaded && !projects.projectConnections.length" class="flex flex-col items-center gap-2 px-4 py-10 text-center">
+          <div class="dim">No connections in this project yet.</div>
+          <button class="btn primary" @click="newConnection"><Icon name="plus" /> New connection</button>
+        </div>
+        <div :style="{ height: totalSize + 'px', position: 'relative', width: '100%' }">
+          <div
+            v-for="it in drawItems"
+            :key="it.key"
+            class="rowwrap px-1.5"
+            :class="it.stuck ? 'stk' : 'absolute left-0 right-0 top-0'"
+            :style="it.stuck ? { top: it.y + 'px', zIndex: it.z, height: rowH + 'px' } : { transform: `translateY(${it.y}px)`, height: rowH + 'px' }"
+          >
+            <div
+              class="tree-row group relative flex h-full items-center gap-1.5 whitespace-nowrap pr-2"
+              :class="[{
+                sel: selected === it.row.key,
+                foc: focused,
+                act: isActiveTable(it.row),
+                hit: it.row.matched,
+                'cur-hit': currentMatchKey === it.row.key,
+                dimmed: isDimmed(it.row),
+                section: it.row.kind === 'section',
+                msg: it.row.kind === 'msg',
+                dragging: it.row.kind === 'conn' && dragConn === it.row.connId,
+              }, it.stuck ? undefined : dropClass(it.row)]"
+              :style="{
+                paddingLeft: 6 + it.row.level * 12 + 'px',
+              }"
+              :role="it.stuck ? undefined : 'treeitem'"
+              :data-accent="accentOf(it.row.connId)"
+              :aria-selected="it.stuck ? undefined : selected === it.row.key"
+              :aria-hidden="it.stuck || undefined"
+              :title="rowTitle(it.row)"
+              @click="it.stuck ? onStickyClick(it.row) : onRowClick(it.row)"
+              @dblclick="onRowDblClick(it.row)"
+              @contextmenu="onContext($event, it.row)"
+              :draggable="it.row.kind === 'conn'"
+              @dragstart="onDragStart($event, it.row)"
+              @dragover="onDragOver($event, it.row)"
+              @drop="onDrop"
+              @dragend="onDragEnd"
+            >
+              <!-- subtle vertical indent guides -->
+              <template v-if="!it.stuck && it.row.level > 0">
+                <span
+                  v-for="g in it.row.level"
+                  :key="g"
+                  class="iguide"
+                  :class="{ last: g === it.row.level }"
+                  :style="{ left: 6 + (g - 1) * 12 + 5 + 'px' }"
+                />
+              </template>
+
+              <!-- connection row -->
+              <template v-if="it.row.kind === 'conn'">
+                <span
+                  class="chev"
+                  :class="{ open: isOpen(it.row) }"
+                  @click.stop="it.stuck ? onStickyClick(it.row, true) : onChevClick(it.row)"
+                  @dblclick.stop
+                ><Icon name="chev" :size="11" /></span>
                 <span
                   v-if="projects.statuses[it.row.connId]?.connecting"
                   class="spinner"
@@ -1386,67 +1549,129 @@ function rowTitle(r: Row): string | undefined {
                 />
                 <span
                   v-else-if="projects.statuses[it.row.connId]?.error && !projects.statuses[it.row.connId]?.connected"
-                  class="text-danger"
+                  class="flex-none text-danger"
                   :title="projects.statuses[it.row.connId]?.error"
                 ><Icon name="warn" :size="12" /></span>
                 <span
-                  v-else-if="projects.isConnected(it.row.connId)"
-                  class="inline-block h-[6px] w-[6px] rounded-full bg-ok"
-                  title="Connected"
+                  v-else
+                  class="sdot"
+                  :class="{ on: projects.isConnected(it.row.connId) }"
+                  :style="{ '--dot': statusDotColor(it.row.connId) }"
+                  :title="projects.isConnected(it.row.connId) ? 'Connected' : 'Disconnected'"
                 />
-              </span>
-            </template>
+                <span class="name font-medium">{{ it.row.name }}</span>
+                <span v-if="projects.isReadOnly(it.row.connId)" class="flex-none" :class="accentOf(it.row.connId) === 'red' ? 'text-danger' : 'dim'" title="Read-only"><Icon name="lock" :size="10" /></span>
+                <span class="drv mono">{{ badge(connOf(it.row.connId)?.driver) }}</span>
+                <span class="row-acts" @click.stop @dblclick.stop>
+                  <button
+                    class="act-btn"
+                    tabindex="-1"
+                    title="New SQL console"
+                    aria-label="New SQL console"
+                    @click="tabs.openConsole(it.row.connId)"
+                  ><Icon name="sql" :size="12" /></button>
+                  <button
+                    class="act-btn"
+                    tabindex="-1"
+                    title="Refresh"
+                    aria-label="Refresh connection"
+                    @click="refreshOrExpand(it.row.connId)"
+                  ><Icon name="refresh" :size="11" /></button>
+                </span>
+              </template>
 
-            <template v-else-if="it.row.kind === 'schema'">
-              <Icon name="schema" class="dim" />
-              <span class="truncate">{{ it.row.name }}</span>
-            </template>
+              <!-- schema row -->
+              <template v-else-if="it.row.kind === 'schema'">
+                <span
+                  class="chev"
+                  :class="{ open: isOpen(it.row) }"
+                  @click.stop="it.stuck ? onStickyClick(it.row, true) : onChevClick(it.row)"
+                  @dblclick.stop
+                ><Icon name="chev" :size="11" /></span>
+                <Icon name="schema" :size="12" class="tico" />
+                <span class="name">{{ it.row.name }}</span>
+              </template>
 
-            <template v-else-if="it.row.kind === 'group'">
-              <span class="dim text-[11px]">{{ it.row.name }}</span>
-              <span class="cnt">{{ it.row.count }}</span>
-            </template>
+              <!-- "Other schemas / databases" group -->
+              <template v-else-if="it.row.kind === 'group'">
+                <span
+                  class="chev"
+                  :class="{ open: isOpen(it.row) }"
+                  @click.stop="it.stuck ? onStickyClick(it.row, true) : onChevClick(it.row)"
+                  @dblclick.stop
+                ><Icon name="chev" :size="11" /></span>
+                <span class="dim text-[11px]">{{ it.row.name }}</span>
+                <span class="cnt">{{ it.row.count }}</span>
+              </template>
 
-            <template v-else-if="it.row.kind === 'table'">
-              <Icon :name="isViewKind(it.row.tkind ?? '') ? 'view' : 'table'" class="dim" />
-              <span class="mono name" :class="{ dimname: it.row.byCol && searching }">
-                <template v-for="(s, i) in fitRow(it.row).name" :key="i"><span :class="{ m: s.m }">{{ s.t }}</span></template>
-              </span>
-              <span v-if="it.row.hint" class="hint mono hintcol">
-                · <template v-for="(s, i) in fitRow(it.row).hint" :key="i"><span :class="{ m: s.m }">{{ s.t }}</span></template>
-              </span>
-            </template>
+              <!-- non-indenting section header (Tables / Views when views exist) -->
+              <template v-else-if="it.row.kind === 'section'">
+                <span
+                  class="chev"
+                  :class="{ open: isOpen(it.row) }"
+                  @click.stop="onChevClick(it.row)"
+                  @dblclick.stop
+                ><Icon name="chev" :size="10" /></span>
+                <span class="sec-lbl">{{ it.row.name }}</span>
+                <span class="cnt">{{ it.row.count }}</span>
+              </template>
 
-            <template v-else-if="it.row.kind === 'col'">
-              <span v-if="it.row.pk" class="cico text-pk"><Icon name="key" :size="11" /></span>
-              <span v-else-if="it.row.fk" class="cico text-fk"><Icon name="link" :size="11" /></span>
-              <span v-else class="cico"><span class="cdot" /></span>
-              <span class="mono name">
-                <template v-for="(s, i) in fitRow(it.row).name" :key="i"><span :class="{ m: s.m }">{{ s.t }}</span></template>
-              </span>
-              <span v-if="it.row.ctype" class="hint mono ctype">{{ it.row.ctype }}</span>
-            </template>
+              <!-- table / view row -->
+              <template v-else-if="it.row.kind === 'table'">
+                <span
+                  class="tchev"
+                  :class="{ open: isOpen(it.row) }"
+                  title="Show columns"
+                  @click.stop="onChevClick(it.row)"
+                  @dblclick.stop
+                ><Icon name="chev" :size="10" /></span>
+                <Icon :name="isViewKind(it.row.tkind ?? '') ? 'view' : 'table'" :size="13" class="tico" />
+                <span class="name">
+                  <template v-for="(s, i) in rowSegs(it.row)" :key="i"><mark v-if="s.m" class="hl">{{ s.t }}</mark><template v-else>{{ s.t }}</template></template>
+                </span>
+                <span v-if="formatCompactRows(it.row.estRows)" class="rcnt mono">{{ formatCompactRows(it.row.estRows) }}</span>
+                <span class="row-acts" @click.stop @dblclick.stop>
+                  <button
+                    class="act-btn"
+                    tabindex="-1"
+                    :title="kbd('Open structure (⌘↵)')"
+                    aria-label="Open structure"
+                    @click="openTable(it.row, true, false, true)"
+                  ><Icon name="structure" :size="12" /></button>
+                </span>
+              </template>
 
-            <template v-else-if="it.row.kind === 'more'">
-              <span class="cico" />
-              <span class="dim text-[11px]">{{ it.row.count }} more…</span>
-            </template>
+              <!-- column row -->
+              <template v-else-if="it.row.kind === 'col'">
+                <span v-if="it.row.pk" class="cico text-pk"><Icon name="key" :size="11" /></span>
+                <span v-else-if="it.row.fk" class="cico text-fk"><Icon name="link" :size="11" /></span>
+                <span v-else class="cico"><span class="cdot" /></span>
+                <span class="name text-[12px]">
+                  <template v-for="(s, i) in rowSegs(it.row)" :key="i"><mark v-if="s.m" class="hl">{{ s.t }}</mark><template v-else>{{ s.t }}</template></template>
+                </span>
+                <span v-if="it.row.ctype" class="ctype mono">{{ it.row.ctype }}</span>
+              </template>
 
-            <template v-else>
-              <span :class="it.row.error ? 'text-danger' : 'dim'" class="truncate text-[11px]">{{ it.row.error ? shortError(it.row.text ?? "") : it.row.text }}</span>
-              <span v-if="it.row.error" class="dim flex-none text-[10px]">· retry</span>
-            </template>
+              <!-- message / error row -->
+              <template v-else>
+                <span :class="it.row.error ? 'text-danger' : 'dim'" class="truncate text-[11px]">{{ it.row.error ? shortError(it.row.text ?? "") : it.row.text }}</span>
+                <span v-if="it.row.error" class="dim flex-none text-[10px]">· retry</span>
+              </template>
+            </div>
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- speed search overlay -->
-    <div v-if="searching" class="speed" @mousedown="onSpeedMouse">
-      <Icon name="search" class="text-ac" />
-      <span class="speed-text mono" :class="{ all: speedAll }"><span>{{ speed }}</span></span>
-      <span class="dim whitespace-nowrap">{{ matchText }}</span>
-      <kbd class="cursor-pointer" title="Clear filter" @click="clearSpeed(true)">esc</kbd>
+      <!-- scrollbar match overview ticks -->
+      <div v-if="matchTicks.length" class="tick-rail" aria-hidden="true">
+        <span
+          v-for="(t, i) in matchTicks"
+          :key="i"
+          class="tick"
+          :class="{ cur: t.cur }"
+          :style="{ top: t.pct + '%' }"
+        />
+      </div>
     </div>
 
     <div class="resize" @mousedown="startResize" @dblclick="ui.sidebarWidth = 268" />
@@ -1483,49 +1708,179 @@ function rowTitle(r: Row): string | undefined {
 </template>
 
 <style scoped>
-.tree-row { cursor: default; border-radius: 7px; }
-/* sticky ancestor rows: opaque so the rows scrolling underneath don't show through */
-.stk { position: sticky; background: var(--bg2); }
-.stk:has(+ .rowwrap:not(.stk)) { box-shadow: 0 6px 6px -6px var(--shadow); }
+/* header */
+.hdr-proj {
+  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 6px;
+  border: 0; border-radius: 6px; background: transparent; color: var(--tx); cursor: default;
+  transition: background .1s;
+}
+.hdr-proj:hover { background: var(--hov); }
+.hdr-icon {
+  display: inline-flex; flex: none; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--dim); cursor: default; transition: background .1s, color .1s;
+}
+.hdr-icon:hover:not(:disabled) { background: var(--hov); color: var(--tx); }
+.hdr-icon.on { background: var(--selbg); color: var(--ac); }
+.hdr-icon:disabled { opacity: .35; }
+
+/* top find bar */
+.findbox {
+  height: 26px; padding: 0 7px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--bd);
+  transition: border-color .1s, box-shadow .1s;
+}
+.findbox:focus-within { border-color: var(--ac); box-shadow: 0 0 0 2px var(--ring); }
+.find-input {
+  border: 0; background: transparent; color: var(--tx); outline: none; font-size: 12px;
+  width: 100%; padding: 0;
+}
+.find-input::placeholder { color: var(--dim); opacity: .7; }
+.find-cnt {
+  flex: none; font-size: 10.5px; color: var(--dim); font-variant-numeric: tabular-nums;
+}
+.find-cnt.none { color: var(--danger); }
+.find-btn {
+  display: inline-flex; flex: none; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px;
+  background: transparent; color: var(--dim); cursor: default; transition: background .1s, color .1s;
+}
+.find-btn:hover:not(:disabled) { background: var(--hov); color: var(--tx); }
+.find-btn.on { background: var(--selbg); color: var(--ac); }
+.find-btn:disabled { opacity: .3; }
+
+/* tree rows */
+.tree-row { cursor: default; border-radius: 6px; transition: background .08s, opacity .1s; }
+.stk { position: sticky; background: var(--bg2); box-shadow: 0 -1px 0 var(--bg2); }
+.stk:has(+ .rowwrap:not(.stk)) { box-shadow: 0 -1px 0 var(--bg2), 0 6px 6px -6px var(--shadow); }
+.iguide {
+  position: absolute; top: 0; bottom: 0; width: 1px; background: var(--bd); opacity: .65; pointer-events: none;
+  transition: opacity .1s;
+}
+.tree-row:has(.tchev):hover .iguide.last,
+.tree-row:has(.tchev.open) .iguide.last { opacity: 0; }
+
+/* icons & chevrons */
+.tico { flex: none; color: var(--dim); opacity: .75; }
+.chev { display: inline-flex; flex: none; color: var(--dim); opacity: .75; transition: transform .1s, color .1s; }
+.chev.open { transform: rotate(90deg); }
+.tchev {
+  display: inline-flex; flex: none; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-left: -14px; margin-right: -4px; border-radius: 3px;
+  color: var(--dim); opacity: 0; transition: opacity .1s, transform .1s, color .1s;
+}
+.tchev.open { opacity: .85; transform: rotate(90deg); }
+.tree-row:hover .tchev { opacity: .75; }
+.tchev:hover { opacity: 1 !important; color: var(--tx); }
+
+/* unified connection status dot */
+.sdot {
+  width: 7px; height: 7px; border-radius: 50%; flex: none; display: inline-block;
+  border: 1.5px solid var(--dot, var(--dim)); background: transparent;
+  transition: background .15s, box-shadow .15s;
+}
+.sdot.on {
+  border-color: var(--dot, var(--ok));
+  background: var(--dot, var(--ok));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--dot, var(--ok)) 22%, transparent);
+}
+
+/* columns */
 .cico { display: inline-flex; flex: none; width: 13px; justify-content: center; align-items: center; }
-.cdot { width: 4px; height: 4px; border-radius: 50%; background: var(--dim); opacity: .55; }
-/* the type gives way first: the column name is what the row is about */
-.ctype { flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dimname { color: var(--dim); }
+.cdot { width: 4px; height: 4px; border-radius: 50%; background: var(--dim); opacity: .5; }
+.ctype {
+  margin-left: auto; flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 10.5px; color: var(--dim); opacity: .75;
+}
+
+/* text, sections & right-aligned metadata */
+.name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sec-lbl {
+  font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--dim); opacity: .8;
+}
+.cnt { margin-left: auto; color: var(--dim); font: 10px var(--mono); opacity: .7; font-variant-numeric: tabular-nums; }
+.drv {
+  margin-left: auto; flex: none; font-size: 10px; color: var(--dim); opacity: .65;
+  letter-spacing: .04em;
+}
+.rcnt {
+  margin-left: auto; flex: none; font-size: 10.5px; color: var(--dim); opacity: .65;
+  font-variant-numeric: tabular-nums;
+}
+
+/* hover quick actions (swap out driver / row count cleanly on hover) */
+.row-acts { display: none; margin-left: auto; flex: none; align-items: center; gap: 2px; }
+.tree-row:hover .row-acts { display: inline-flex; }
+.tree-row:hover .drv,
+.tree-row:hover .rcnt { display: none; }
+.act-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px;
+  background: transparent; color: var(--dim); cursor: default;
+}
+.act-btn:hover { background: var(--bg3); color: var(--tx); }
+
+/* row states: clearly distinct active tab, keyboard cursor, and find matches */
 .tree-row:hover { background: var(--hov); }
-.tree-row.sel { background: var(--hov); }
-.tree-row.sel.foc { background: var(--selbg); }
-.tree-row.act { color: var(--tx); background: var(--selbg); font-weight: 500; }
-.tree-row.act :deep(svg) { color: var(--ac); }
-.tree-row.act .mono { color: var(--tx); }
 .tree-row.msg:hover { background: none; }
+.tree-row.dimmed { opacity: .45; }
+.tree-row.dimmed:hover { opacity: 1; }
+
+.tree-row.act {
+  color: var(--tx);
+  background: color-mix(in srgb, var(--ac) 10%, transparent);
+  font-weight: 500;
+}
+.tree-row.act::before {
+  content: ""; position: absolute; left: 0; top: 4px; bottom: 4px; width: 2px;
+  border-radius: 2px; background: var(--ac);
+}
+.tree-row.act .tico { color: var(--ac); opacity: 1; }
+
+.tree-row.sel:not(.act):not(.cur-hit) { background: var(--hov); }
+.tree-row.sel.foc:not(.cur-hit):not(.drop-before):not(.drop-after) {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ac) 50%, transparent);
+}
+
+.tree-row.cur-hit {
+  opacity: 1;
+  background: var(--selbg);
+}
+.tree-row.cur-hit:not(.drop-before):not(.drop-after) {
+  box-shadow: inset 0 0 0 1px var(--ac);
+}
+
+/* find match character highlights */
+.hl {
+  background: var(--mark); color: var(--tx); border-radius: 2px; padding: 0 1px; font-weight: 600;
+}
+.tree-row.cur-hit .hl {
+  background: var(--ac); color: var(--ac-fg, #fff);
+}
+
+/* drag & drop */
 .tree-row.dragging { opacity: .5; }
 .tree-row.drop-before { box-shadow: inset 0 2px 0 var(--ac); border-radius: 0; }
 .tree-row.drop-after { box-shadow: inset 0 -2px 0 var(--ac); border-radius: 0; }
-.chev { display: inline-flex; flex: none; color: var(--dim); transition: transform .1s; }
-.chev.open { transform: rotate(90deg); }
-.cnt { margin-left: auto; color: var(--dim); font: 10px var(--mono); }
-.hint { color: var(--dim); font-size: 11px; }
-.name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hintcol { flex: 0 0 auto; white-space: nowrap; }
-.m { color: var(--ac); font-weight: 700; }
-.speed {
-  position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 5;
-  display: flex; align-items: center; gap: 8px; padding: 4px 8px;
-  background: var(--bg); border: 1px solid var(--ac); border-radius: 5px; box-shadow: 0 4px 16px var(--shadow);
+
+/* scrollbar match overview ticks */
+.tick-rail {
+  position: absolute; top: 4px; right: 1px; bottom: 4px; width: 4px;
+  pointer-events: none; z-index: 4;
 }
-.speed-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
-.speed-text::after {
-  content: ""; display: inline-block; width: 1px; height: 12px; background: var(--tx);
-  vertical-align: -2px; margin-left: 1px; animation: blink 1s steps(1) infinite;
+.tick {
+  position: absolute; left: 0; right: 0; height: 2px; border-radius: 1px;
+  background: var(--warn); opacity: .75; transform: translateY(-50%);
 }
-.speed-text.all > span { background: color-mix(in srgb, var(--ac) 35%, transparent); border-radius: 2px; }
-.speed-text.all::after { display: none; }
-@keyframes blink { 50% { opacity: 0; } }
+.tick.cur { height: 3px; background: var(--ac); opacity: 1; z-index: 1; }
+
+/* resize & spinner */
 .resize { position: absolute; top: 0; right: -3px; bottom: 0; width: 6px; cursor: col-resize; z-index: 6; }
 .resize:hover { background: color-mix(in srgb, var(--ac) 40%, transparent); }
 .spinner {
-  width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--bd); border-top-color: var(--ac);
+  width: 10px; height: 10px; flex: none; border-radius: 50%;
+  border: 1.5px solid var(--bd); border-top-color: var(--ac);
   animation: spin .7s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
