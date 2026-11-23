@@ -18,7 +18,7 @@ export const appTheme = EditorView.theme({
   ".cm-selectionMatch": { background: "var(--mark)" },
   ".cm-matchingBracket": { background: "var(--selbg)", outline: "1px solid var(--selbd)" },
   ".cm-placeholder": { color: "var(--dim)" },
-  ".cm-tooltip": { background: "var(--bg2)", border: "1px solid var(--bd)", borderRadius: "6px", boxShadow: "0 8px 28px var(--shadow)", color: "var(--tx)" },
+  ".cm-tooltip": { zIndex: "var(--z-popover, 40)", background: "var(--bg2)", border: "1px solid var(--bd)", borderRadius: "6px", boxShadow: "0 8px 28px var(--shadow)", color: "var(--tx)" },
   ".cm-tooltip.cm-tooltip-autocomplete > ul": { fontFamily: "var(--mono)", fontSize: "12px", maxHeight: "260px" },
   ".cm-tooltip-autocomplete ul li": { padding: "1px 8px" },
   ".cm-tooltip-autocomplete ul li[aria-selected]": { background: "var(--ac)", color: "var(--ac-fg, #fff)" },

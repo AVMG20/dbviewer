@@ -220,6 +220,6 @@ defineExpose({
 </template>
 
 <style scoped>
-.sqled { height: 100%; min-height: 0; overflow: hidden; }
+.sqled { height: 100%; min-height: 0; }
 .sqled :deep(.cm-editor) { height: 100%; }
 </style>

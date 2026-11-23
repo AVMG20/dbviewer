@@ -8,7 +8,7 @@ import { EditorView, keymap, placeholder as cmPlaceholder } from "@codemirror/vi
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { syntaxHighlighting, bracketMatching } from "@codemirror/language";
 import {
-  acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, type Completion, type CompletionContext,
+  acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, closeCompletion, completionKeymap, type Completion, type CompletionContext,
 } from "@codemirror/autocomplete";
 import { MariaSQL, MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { appHighlight, appTheme } from "@/components/console/cmTheme";
@@ -78,11 +78,11 @@ onMounted(() => {
         singleLine,
         keymap.of([
           { key: "Tab", run: acceptCompletion },
-          { key: "Enter", run: () => (emit("apply"), true) },
-          { key: "Mod-Enter", run: () => (emit("apply"), true) },
+          { key: "Enter", run: (v) => (closeCompletion(v), emit("apply"), true) },
+          { key: "Mod-Enter", run: (v) => (closeCompletion(v), emit("apply"), true) },
           ...closeBracketsKeymap, ...completionKeymap,
           { key: "Escape", run: () => (emit("escape"), false) },
-          { key: "Mod-\\", run: () => (emit("ai"), true) },
+          { key: "Mod-\\", run: (v) => (closeCompletion(v), emit("ai"), true) },
           ...historyKeymap, ...defaultKeymap.filter((b) => b.key !== "Enter" && b.key !== "Mod-Enter"),
         ]),
         history(),
@@ -133,17 +133,19 @@ defineExpose({
 .ci { flex: 1 1 220px; display: flex; align-items: center; gap: 6px; min-width: 160px; }
 .ci-l { font-size: 11px; }
 .ci-ed {
-  flex: 1; min-width: 0; height: 22px; overflow: hidden; background: var(--bg); border: 1px solid var(--bd); border-radius: 4px;
+  flex: 1; min-width: 0; height: 22px; background: var(--bg); border: 1px solid var(--bd); border-radius: 4px;
 }
 .ci-ed:focus-within { border-color: var(--ac); }
 .ci.err .ci-ed { border-color: var(--danger); box-shadow: 0 1px 0 var(--danger); }
 .ci-ed :deep(.cm-editor) { height: 100%; }
 /* single-line field: never scroll vertically, hide the horizontal scrollbar (it still scrolls with the caret) */
 .ci-ed :deep(.cm-scroller) {
-  height: 100%; align-items: center; line-height: 20px !important;
+  height: 100%; align-items: center; line-height: 20px !important; border-radius: 3px;
   overflow-y: hidden !important; overflow-x: auto; scrollbar-width: none;
 }
 .ci-ed :deep(.cm-scroller::-webkit-scrollbar) { display: none; }
 .ci-ed :deep(.cm-content) { padding: 0 6px !important; min-height: 0 !important; }
 .ci-ed :deep(.cm-line) { padding: 0 !important; line-height: 20px; }
+.ci-ed :deep(.cm-tooltip.cm-tooltip-below) { margin-top: 4px; }
+.ci-ed :deep(.cm-tooltip.cm-tooltip-above) { margin-top: -4px; }
 </style>
